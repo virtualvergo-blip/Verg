@@ -677,32 +677,229 @@ class TokenAnalyzer:
             logger.debug("Token age error: %s", e)
         return None
 
+    # ── HELIUS TRANSACTION-BASED CANDLES ───────────────────────────────────────
+
+    async def fetch_candles_from_transactions(
+        self, address: str, call_time: datetime, lookback_minutes: int = 60
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """
+        Fetch transactions from Helius and reconstruct price candles at multiple timeframes.
+        
+        This is the KEY to getting historical price action at the exact call time.
+        Helius provides transaction-level data which we can aggregate into candles.
+        
+        Timeframes: 5s, 15s, 30s, 1m, 5m, 10m
+        Returns dict like: {"5s": [...], "15s": [...], "30s": [...], "1m": [...], "5m": [...], "10m": [...]}
+        Each candle: {"timestamp": unix_ts, "open": price, "high": price, "low": price, "close": price, "volume": usd}
+        """
+        if not HELIUS_API_KEY:
+            logger.warning("HELIUS_API_KEY not set, cannot fetch transaction candles")
+            return None
+        
+        logger.info("=== FETCHING TX CANDLES for %s from %s ===", address[:8], call_time.strftime("%Y-%m-%d %H:%M"))
+        
+        # Calculate time range
+        start_time = call_time
+        end_time = call_time + timedelta(minutes=lookback_minutes)
+        start_ts = int(start_time.timestamp())
+        end_ts = int(end_time.timestamp())
+        
+        # Fetch transactions using Helius Enhanced Transactions API
+        url = HELIUS_RPC
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "candles-tx-fetch",
+            "method": "getTransactionHistory",
+            "params": [
+                address,
+                {
+                    "startTime": start_ts,
+                    "endTime": end_ts,
+                    "limit": 1000  # Max transactions to fetch
+                }
+            ]
+        }
+        
+        try:
+            session = await self._session_get()
+            async with self.semaphore:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.warning("Helius TX history HTTP %s", resp.status)
+                        return None
+                    result = await resp.json()
+                    
+            tx_list = result.get("result", [])
+            if not tx_list:
+                logger.warning("No transactions found for %s in time range", address[:8])
+                return None
+            
+            logger.info("Found %s transactions for %s", len(tx_list), address[:8])
+            
+            # Extract price from each transaction
+            # Parse transaction to get token amount and SOL amount for price calculation
+            prices_with_time = []
+            for tx in tx_list:
+                try:
+                    tx_time = tx.get("blockTime", 0)
+                    if not tx_time:
+                        continue
+                    
+                    # Parse transaction instructions to find token swaps
+                    # This is simplified - real implementation needs deeper parsing
+                    meta = tx.get("meta", {})
+                    if not meta or meta.get("err"):
+                        continue
+                    
+                    post_balances = meta.get("postTokenBalances", [])
+                    pre_balances = meta.get("preTokenBalances", [])
+                    
+                    # Find balance change for our token
+                    token_balance_change = 0
+                    for pb in post_balances:
+                        if pb.get("mint") == address:
+                            for pre in pre_balances:
+                                if pre.get("mint") == address and pre.get("owner") == pb.get("owner"):
+                                    token_balance_change = pb.get("uiTokenAmount", {}).get("uiAmount", 0) - pre.get("uiTokenAmount", {}).get("uiAmount", 0)
+                                    break
+                            break
+                    
+                    if token_balance_change == 0:
+                        continue
+                    
+                    # Get SOL balance change for price calculation
+                    sol_pre = meta.get("preBalances", [])[0] if meta.get("preBalances") else 0
+                    sol_post = meta.get("postBalances", [])[0] if meta.get("postBalances") else 0
+                    sol_change_lamports = sol_post - sol_pre
+                    sol_change = sol_change_lamports / 1e9  # Convert lamports to SOL
+                    
+                    # Price = SOL change / token change (absolute values)
+                    if token_balance_change != 0:
+                        price_sol = abs(sol_change) / abs(token_balance_change)
+                        # Approximate USD price (we'll enrich with actual SOL/USD rate later)
+                        price_usd = price_sol * 150  # Rough SOL price estimate
+                        
+                        prices_with_time.append({
+                            "timestamp": tx_time,
+                            "price": price_usd,
+                            "volume_usd": abs(token_balance_change) * price_usd,
+                            "is_buy": token_balance_change > 0  # Positive = bought token
+                        })
+                except Exception as e:
+                    logger.debug("Error parsing tx: %s", e)
+                    continue
+            
+            if not prices_with_time:
+                logger.warning("Could not extract prices from transactions for %s", address[:8])
+                return None
+            
+            # Sort by timestamp
+            prices_with_time.sort(key=lambda x: x["timestamp"])
+            
+            # Aggregate into candles at different timeframes
+            timeframes = {
+                "5s": 5,
+                "15s": 15,
+                "30s": 30,
+                "1m": 60,
+                "5m": 300,
+                "10m": 600
+            }
+            
+            candles_by_tf = {}
+            for tf_name, tf_seconds in timeframes.items():
+                candles = self._aggregate_to_candles(prices_with_time, tf_seconds)
+                candles_by_tf[tf_name] = candles
+            
+            logger.info("Generated candles for %s: %s", address[:8], {k: len(v) for k, v in candles_by_tf.items()})
+            return candles_by_tf
+            
+        except Exception as e:
+            logger.exception("Error fetching transaction candles: %s", e)
+            return None
+    
+    def _aggregate_to_candles(
+        self, prices: List[Dict], timeframe_seconds: int
+    ) -> List[Dict]:
+        """Aggregate individual trades into OHLCV candles."""
+        if not prices:
+            return []
+        
+        candles = []
+        current_candle_start = prices[0]["timestamp"]
+        candle_prices = []
+        
+        for trade in prices:
+            ts = trade["timestamp"]
+            
+            # Check if we need to close current candle and start new one
+            if ts >= current_candle_start + timeframe_seconds:
+                # Close current candle
+                if candle_prices:
+                    candle = self._create_candle(candle_prices, current_candle_start)
+                    candles.append(candle)
+                
+                # Start new candle
+                current_candle_start = ((ts // timeframe_seconds) * timeframe_seconds)
+                candle_prices = [trade]
+            else:
+                candle_prices.append(trade)
+        
+        # Don't forget the last candle
+        if candle_prices:
+            candle = self._create_candle(candle_prices, current_candle_start)
+            candles.append(candle)
+        
+        return candles
+    
+    def _create_candle(self, trades: List[Dict], start_ts: int) -> Dict:
+        """Create a single OHLCV candle from list of trades."""
+        if not trades:
+            return {}
+        
+        prices = [t["price"] for t in trades]
+        volumes = [t["volume_usd"] for t in trades]
+        
+        return {
+            "timestamp": start_ts,
+            "open": prices[0],
+            "high": max(prices),
+            "low": min(prices),
+            "close": prices[-1],
+            "volume": sum(volumes),
+            "trade_count": len(trades),
+            "buys": sum(1 for t in trades if t.get("is_buy", False)),
+            "sells": sum(1 for t in trades if not t.get("is_buy", False))
+        }
+
     # ── MAIN SNAPSHOT ─────────────────────────────────────────────────────────
 
     async def fetch_snapshot(
         self, address: str, call_time: datetime
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetch token snapshot.
+        Fetch token snapshot WITH HISTORICAL PRICE ACTION from call time.
         
-        NOTE: Crypto APIs don't provide historical snapshots at arbitrary timestamps.
-        We fetch CURRENT data and use it as a proxy for the call time.
-        For labeling (PUMP/DUMP), we compare current price vs entry price later.
+        NEW APPROACH:
+        1. Use Helius Transaction API to fetch ALL transactions from call_time
+        2. Reconstruct price candles at 5s, 15s, 30s, 1m, 5m, 10m timeframes
+        3. Analyze patterns from these candles for AI prediction
         
-        Strategy (parallel fetch for speed):
-          1. pump.fun API → untuk pre-graduation tokens (MAYORITAS)
-          2. DexScreener → untuk graduated/Raydium tokens  
-          3. GeckoTerminal → fallback gratis untuk DEX data (替代 Birdeye)
-          4. Helius RPC → enrich dengan on-chain data (holder, txns)
+        This gives us REAL historical data from the exact moment the token was called!
+        
+        Fallback chain (parallel fetch for speed):
+          1. Helius Transaction Candles → PRIMARY SOURCE (historical price action)
+          2. pump.fun API → untuk token metadata & current state
+          3. DexScreener → untuk graduated tokens
+          4. GeckoTerminal → fallback gratis
           5. Jupiter Price → konfirmasi harga
-          6. Validate: skip jika price=0 AND mcap=0
-        
-        IMPORTANT: Selalu fetch fresh data dari API secara PARALLEL.
-        Parallel fetching membuat proses 3x lebih cepat.
         """
-        logger.info("=== FETCHING SNAPSHOT for %s ===", address[:8])
+        logger.info("=== FETCHING SNAPSHOT for %s at %s ===", address[:8], call_time.strftime("%Y-%m-%d %H:%M"))
         
-        # Fetch from all sources in PARALLEL for speed
+        # PRIORITY 1: Fetch transaction-based candles from Helius (HISTORICAL DATA!)
+        tx_candles = await self.fetch_candles_from_transactions(address, call_time, lookback_minutes=60)
+        
+        # Fetch other data in PARALLEL while processing candles
         pumpfun_task = asyncio.create_task(self.fetch_pumpfun(address))
         dex_task     = asyncio.create_task(self.fetch_dexscreener(address))
         gecko_task   = asyncio.create_task(self.fetch_geckoterminal(address))
@@ -738,16 +935,96 @@ class TokenAnalyzer:
         
         snapshot: Optional[Dict[str, Any]] = None
         
-        # ── Try pump.fun first ─────────────────────────────────────────────────
-        if pumpfun_data:
+        # ── Build snapshot from Helius transaction candles (PRIMARY) ───────────
+        if tx_candles:
+            logger.info("✓ Got Helius transaction candles for %s", address[:8])
+            
+            # Get the first candle (closest to call time) as entry point
+            first_candle_1m = tx_candles.get("1m", [{}])[0] if tx_candles.get("1m") else {}
+            entry_price = first_candle_1m.get("open", 0)
+            
+            # Calculate metrics from candles
+            price_5s = tx_candles.get("5s", [])
+            price_1m = tx_candles.get("1m", [])
+            price_10m = tx_candles.get("10m", [])
+            
+            # Volatility: % change from first to last candle in each timeframe
+            vol_5s = self._calc_volatility(price_5s)
+            vol_1m = self._calc_volatility(price_1m)
+            vol_10m = self._calc_volatility(price_10m)
+            
+            # Volume analysis
+            total_vol_10m = sum(c.get("volume", 0) for c in price_10m)
+            avg_trade_size = total_vol_10m / max(sum(c.get("trade_count", 0) for c in price_10m), 1)
+            
+            # Buy/sell pressure from candles
+            total_buys = sum(c.get("buys", 0) for c in price_10m)
+            total_sells = sum(c.get("sells", 0) for c in price_10m)
+            buy_sell_ratio = total_buys / max(total_sells, 1)
+            
+            # Get current/latest price from last candle
+            latest_price = price_10m[-1].get("close", entry_price) if price_10m else entry_price
+            
+            snapshot = {
+                "price_usd":          latest_price,
+                "entry_price":        entry_price,
+                "market_cap":         latest_price * 1_000_000_000,  # rough estimate
+                "liquidity_usd":      None,
+                "volume_1h":          total_vol_10m * 6,  # extrapolate
+                "volume_6h":          None,
+                "volume_24h":         None,
+                "price_change_1h":    vol_1m * 100 if vol_1m else None,
+                "price_change_6h":    None,
+                "price_change_24h":   None,
+                "holder_count":       helius_data.get("holder_count") if helius_data else None,
+                "top10_holder_pct":   helius_data.get("top10_holder_pct") if helius_data else None,
+                "token_age_hours":    helius_data.get("token_age_hours") if helius_data else None,
+                "buy_count_1h":       total_buys * 6,  # extrapolate
+                "sell_count_1h":      total_sells * 6,
+                "buy_sell_ratio":     buy_sell_ratio,
+                "tx_count_24h":       sum(c.get("trade_count", 0) for c in price_10m) * 144,  # extrapolate
+                "dex_name":           "raydium",  # assume DEX
+                "symbol":             "?",
+                "name":               "Unknown",
+                "graduated":          True,
+                "data_source":        "helius_tx_candles",
+                # Store candle data for AI analysis
+                "candles_5s":         json.dumps(price_5s)[:5000],
+                "candles_15s":        json.dumps(price_15s)[:5000] if (price_15s := tx_candles.get("15s")) else "[]",
+                "candles_30s":        json.dumps(tx_candles.get("30s", []))[:5000],
+                "candles_1m":         json.dumps(price_1m)[:5000],
+                "candles_5m":         json.dumps(tx_candles.get("5m", []))[:5000],
+                "candles_10m":        json.dumps(price_10m)[:5000],
+                "volatility_5s":      vol_5s,
+                "volatility_1m":      vol_1m,
+                "volatility_10m":     vol_10m,
+                "avg_trade_size":     avg_trade_size,
+                "raw_json":           json.dumps({"tx_candles": True, "candle_count": len(price_1m)})[:2000],
+            }
+            
+            # Enrich with pump.fun/DexScreener if available
+            if pumpfun_data:
+                snapshot["symbol"] = pumpfun_data.get("symbol", "?")
+                snapshot["name"] = pumpfun_data.get("name", "Unknown")
+                snapshot["graduated"] = pumpfun_data.get("complete", False)
+                snapshot["data_source"] = "helius_tx_candles+pumpfun"
+            
+            if dex_pair:
+                dex_mcap = _safe_float(dex_pair.get("marketCap")) or _safe_float(dex_pair.get("fdv"))
+                if dex_mcap and dex_mcap > 0:
+                    snapshot["market_cap"] = dex_mcap
+                snapshot["liquidity_usd"] = _safe_float((dex_pair.get("liquidity") or {}).get("usd"))
+                snapshot["data_source"] = "helius_tx_candles+dexscreener"
+
+        # ── Fallback to pump.fun (no historical candles, just current state) ───
+        if not snapshot and pumpfun_data:
             snapshot = self._pumpfun_to_snapshot(pumpfun_data, address)
-            logger.info("✓ Got pump.fun data: mcap=$%.0f", snapshot.get("market_cap", 0))
+            logger.info("✓ Got pump.fun data (fallback): mcap=$%.0f", snapshot.get("market_cap", 0))
             
             # If graduated, enrich with DexScreener
             if snapshot.get("graduated") and dex_pair:
                 logger.info("%s graduated — enriching with DexScreener...", address[:8])
                 dex_snap = self._dexscreener_to_snapshot(dex_pair, address, None)
-                # Merge: prefer DexScreener fields when available
                 for field in ("volume_1h", "volume_6h", "volume_24h",
                               "price_change_1h", "price_change_6h", "price_change_24h",
                               "buy_count_1h", "sell_count_1h", "buy_sell_ratio",
@@ -763,12 +1040,12 @@ class TokenAnalyzer:
         # ── Fallback to DexScreener ────────────────────────────────────────────
         if not snapshot and dex_pair:
             snapshot = self._dexscreener_to_snapshot(dex_pair, address, None)
-            logger.info("✓ Got DexScreener data: liquidity=$%.0f", snapshot.get("liquidity_usd", 0))
+            logger.info("✓ Got DexScreener data (fallback): liquidity=$%.0f", snapshot.get("liquidity_usd", 0))
 
         # ── Fallback to GeckoTerminal ──────────────────────────────────────────
         if not snapshot and gecko_data:
             snapshot = self._geckoterminal_to_snapshot(gecko_data, address)
-            logger.info("✓ Got GeckoTerminal data: price=$%.8f", snapshot.get("price_usd", 0))
+            logger.info("✓ Got GeckoTerminal data (fallback): price=$%.8f", snapshot.get("price_usd", 0))
 
         # ── Enrich with Helius on-chain data ───────────────────────────────────
         if snapshot and helius_data:
@@ -777,13 +1054,14 @@ class TokenAnalyzer:
                 helius_val = helius_data.get(field)
                 if helius_val is not None:
                     snapshot[field] = helius_val
-            snapshot["data_source"] = f"{snapshot.get('data_source', '')}+helius"
+            if "helius" not in snapshot.get("data_source", ""):
+                snapshot["data_source"] = f"{snapshot.get('data_source', '')}+helius"
 
         # ── Use Jupiter price if still no snapshot ─────────────────────────────
         if not snapshot and jupiter_price and jupiter_price > 0:
             snapshot = {
                 "price_usd": jupiter_price,
-                "market_cap": jupiter_price * 1_000_000_000,  # rough estimate
+                "market_cap": jupiter_price * 1_000_000_000,
                 "liquidity_usd": None,
                 "volume_1h": None,
                 "volume_6h": None,
@@ -805,7 +1083,7 @@ class TokenAnalyzer:
                 "data_source": "jupiter",
                 "raw_json": "{}",
             }
-            logger.info("✓ Got Jupiter price only: $%.8f", jupiter_price)
+            logger.info("✓ Got Jupiter price only (fallback): $%.8f", jupiter_price)
 
         # ── No data from any source ────────────────────────────────────────────
         if not snapshot:
@@ -830,6 +1108,16 @@ class TokenAnalyzer:
                    snapshot.get("price_usd", 0), snapshot.get("market_cap", 0))
 
         return snapshot
+
+    def _calc_volatility(self, candles: List[Dict]) -> float:
+        """Calculate % price change from first to last candle."""
+        if not candles or len(candles) < 2:
+            return 0.0
+        first = candles[0].get("open", 0)
+        last = candles[-1].get("close", 0)
+        if first == 0:
+            return 0.0
+        return (last - first) / first
 
     # ── CURRENT PRICE ─────────────────────────────────────────────────────────
 
