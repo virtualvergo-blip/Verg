@@ -20,7 +20,7 @@ HELIUS_BASE = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 class TokenAnalyzer:
     def __init__(self, db):
         self.db = db
-        self.groq = Npne # initialized lazily in preidct()
+        self.groq = None # initialized lazily in preidct()
 
     # ─────────────────────────────────────────────
     # SESSION MANAGEMENT
