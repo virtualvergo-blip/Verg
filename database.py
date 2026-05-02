@@ -27,7 +27,7 @@ class Database:
                     address         TEXT PRIMARY KEY,
                     call_time       TEXT NOT NULL,
                     raw_message     TEXT,
-                    label           TEXT,           -- PUMP / DUMP / NULL (pending)
+                    label           TEXT,
                     max_pct_change  REAL,
                     created_at      TEXT DEFAULT (datetime('now'))
                 );
@@ -53,6 +53,7 @@ class Database:
                     dex_name            TEXT,
                     symbol              TEXT,
                     name                TEXT,
+                    data_source         TEXT DEFAULT 'unknown',
                     raw_json            TEXT,
                     fetched_at          TEXT DEFAULT (datetime('now'))
                 );
@@ -60,7 +61,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS price_checks (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     address         TEXT NOT NULL,
-                    window_label    TEXT NOT NULL,   -- 1h, 6h, 24h
+                    window_label    TEXT NOT NULL,
                     price           REAL,
                     pct_change      REAL,
                     checked_at      TEXT DEFAULT (datetime('now'))
@@ -68,8 +69,8 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS ai_predictions (
                     address         TEXT PRIMARY KEY,
-                    score           REAL,           -- 0-100, higher = more likely PUMP
-                    verdict         TEXT,           -- GO / CAUTION / SKIP
+                    score           REAL,
+                    verdict         TEXT,
                     reasoning       TEXT,
                     similar_winners INTEGER,
                     similar_losers  INTEGER,
@@ -106,8 +107,8 @@ class Database:
                     price_change_1h, price_change_6h, price_change_24h,
                     holder_count, top10_holder_pct, token_age_hours,
                     buy_count_1h, sell_count_1h, buy_sell_ratio,
-                    tx_count_24h, dex_name, symbol, name, raw_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    tx_count_24h, dex_name, symbol, name, data_source, raw_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     address,
                     snapshot.get('price_usd'),
@@ -129,6 +130,7 @@ class Database:
                     snapshot.get('dex_name'),
                     snapshot.get('symbol'),
                     snapshot.get('name'),
+                    snapshot.get('data_source', 'unknown'),
                     json.dumps(snapshot)
                 )
             )
@@ -167,7 +169,6 @@ class Database:
             )
 
     def get_labeled_tokens(self, label: Optional[str] = None, limit: int = 200) -> List[Dict]:
-        """Get historical labeled tokens with their snapshots for pattern matching"""
         with self.get_conn() as conn:
             if label:
                 rows = conn.execute(
