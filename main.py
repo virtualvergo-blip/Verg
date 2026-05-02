@@ -25,6 +25,14 @@ SKIP_ADDRESSES = {
 
 PUMP_THRESHOLD = float(os.environ.get('PUMP_THRESHOLD', '30'))
 
+# Pattern untuk skip pesan update (bukan call baru)
+UPDATE_PATTERNS = [
+    re.compile(r'\d+\.\d+x', re.I),           # "2.7x", "3.6x"
+    re.compile(r'from\s+premium', re.I),        # "from PREMIUM"
+    re.compile(r'update:', re.I),              # "Update: Cancer Coin"
+    re.compile(r'🎉.*\$[A-Z]+', re.I),         # "🎉 $CANCER 2.7x"
+]
+
 
 class SignalBot:
     def __init__(self):
@@ -44,9 +52,21 @@ class SignalBot:
             self.api_hash
         )
 
+    def is_update_message(self, text: str) -> bool:
+        """Check if message is an update (not a new call)."""
+        for pattern in UPDATE_PATTERNS:
+            if pattern.search(text):
+                return True
+        return False
+
     async def handle_new_message(self, event):
         msg = event.message
         text = msg.text or ''
+
+        # Skip update messages (pump updates, not new calls)
+        if self.is_update_message(text):
+            logger.info("Skipping update message")
+            return
 
         addresses = SOLANA_ADDR_RE.findall(text)
         if not addresses:
@@ -62,13 +82,13 @@ class SignalBot:
                 logger.info(f"Token {addr[:8]}... already in DB, skipping")
                 continue
 
-            logger.info(f"New token detected: {addr[:8]}... at {timestamp}")
+            logger.info(f"New token call: {addr[:8]}... at {timestamp}")
 
             self.db.save_call(addr, timestamp, text)
 
             snapshot = await self.analyzer.fetch_snapshot(addr, timestamp)
             if not snapshot:
-                logger.warning(f"Could not fetch snapshot for {addr[:8]}...")
+                logger.warning(f"No snapshot for {addr[:8]}...")
                 continue
 
             self.db.save_snapshot(addr, snapshot)
@@ -97,7 +117,7 @@ class SignalBot:
         ]
         entry_price = snapshot.get('price_usd', 0)
         if not entry_price:
-            logger.warning(f"No entry price for {addr[:8]}..., skipping label schedule")
+            logger.warning(f"No entry price for {addr[:8]}...")
             return
 
         for delay_sec, window_label in windows:
@@ -107,16 +127,14 @@ class SignalBot:
                 if current and entry_price:
                     pct_change = ((current - entry_price) / entry_price) * 100
                     self.db.save_price_check(addr, window_label, current, pct_change)
-                    logger.info(f"{addr[:8]}... {window_label} result: {pct_change:+.1f}%")
+                    logger.info(f"{addr[:8]}... {window_label}: {pct_change:+.1f}%")
 
                     if window_label == '24h':
                         outcome = 'PUMP' if pct_change >= PUMP_THRESHOLD else 'DUMP'
                         self.db.update_label(addr, outcome, pct_change)
-                        logger.info(
-                            f"Auto-labeled {addr[:8]}... as {outcome} ({pct_change:+.1f}%)"
-                        )
+                        logger.info(f"Auto-labeled {addr[:8]}... as {outcome}")
             except Exception as e:
-                logger.error(f"Label check error for {addr[:8]}... at {window_label}: {e}")
+                logger.error(f"Label check error {addr[:8]}... {window_label}: {e}")
 
     async def run(self):
         await self.client.start()
@@ -127,7 +145,7 @@ class SignalBot:
             title = entity.title if hasattr(entity, 'title') else self.source_channel
             logger.info(f"Monitoring channel: {title}")
         except Exception as e:
-            logger.error(f"Could not resolve channel '{self.source_channel}': {e}")
+            logger.error(f"Could not resolve channel: {e}")
             return
 
         @self.client.on(events.NewMessage(chats=entity))
