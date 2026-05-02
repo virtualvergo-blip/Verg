@@ -7,7 +7,7 @@ from typing import Optional, Dict, List, Any
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.environ.get('DB_PATH', 'signals.db')
+DB_PATH = 'signals.db'
 
 
 class Database:
