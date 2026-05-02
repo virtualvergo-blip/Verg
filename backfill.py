@@ -125,20 +125,23 @@ async def backfill(limit: int, days: int) -> None:
             db.save_call(addr, call_time, raw_msg)
 
             try:
+                # Fetch snapshot AT CALL TIME (historical)
                 snapshot = await analyzer.fetch_snapshot(addr, call_time)
                 if not snapshot:
-                    logger.warning("  No data found, skipping")
+                    logger.warning("  No snapshot data, skipping")
                     failed += 1
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     continue
 
                 db.save_snapshot(addr, snapshot)
                 source = snapshot.get('data_source', 'unknown')
-                logger.info(f"  ✓ Snapshot from {source.upper()}")
+                price = snapshot.get('price_usd', 0)
+                logger.info(f"  ✓ Snapshot from {source.upper()} | price=${price:.10f}")
 
                 hours_since_call = (now - call_time).total_seconds() / 3600
 
                 if hours_since_call >= 24:
+                    # Check current price to label PUMP/DUMP
                     current_price = await analyzer.fetch_current_price(addr)
                     entry_price = snapshot.get("price_usd", 0)
 
@@ -146,23 +149,23 @@ async def backfill(limit: int, days: int) -> None:
                         pct = ((current_price - entry_price) / entry_price) * 100
                         label = "PUMP" if pct >= pump_threshold else "DUMP"
                         db.update_label(addr, label, pct)
-                        logger.info("  Labeled as %s (%+.1f%%)", label, pct)
+                        logger.info("  → Labeled %s (%+.1f%%)", label, pct)
                     else:
                         db.update_label(addr, "DUMP", -100.0)
-                        logger.info("  No price data, labeled as DUMP (likely dead)")
+                        logger.info("  → No current price, labeled DUMP")
                 else:
                     logger.info(
-                        "  Recent token (%.1fh old), pending live monitoring",
+                        "  → Recent call (%.1fh ago), pending label",
                         hours_since_call,
                     )
 
                 success += 1
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)  # Rate limit safety
 
             except Exception as exc:
                 logger.exception("  Error processing %s: %s", addr[:8], exc)
                 failed += 1
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
         stats = db.get_stats()
         logger.info(
