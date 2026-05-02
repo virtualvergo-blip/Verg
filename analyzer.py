@@ -186,18 +186,41 @@ class TokenAnalyzer:
         Fetch token data from pump.fun frontend API.
         Works for ALL pump.fun tokens — both pre-graduation and graduated.
         Returns raw pump.fun coin data or None.
+        
+        Tries multiple endpoints in order:
+        1. frontend-api.pump.fun/coins/{address}
+        2. pumpportal.fun/api/data/{address}
         """
+        # Try primary endpoint
         url = f"{PUMPFUN_API}/coins/{address}"
-        logger.debug("pump.fun GET: %s", url)
+        logger.info("pump.fun GET (primary): %s", url)
         data = await self._get(url)
-        if not data or not isinstance(data, dict):
-            return None
-        # Validate: must have mint + name/symbol
-        if not data.get("mint") and not data.get("name"):
-            logger.debug("pump.fun: invalid response for %s", address[:8])
-            return None
-        logger.info("pump.fun OK: %s | mcap=$%.0f", address[:8], data.get("usd_market_cap", 0))
-        return data
+        if data and isinstance(data, dict) and (data.get("mint") or data.get("name")):
+            logger.info("pump.fun OK (primary): %s | mcap=$%.0f", address[:8], data.get("usd_market_cap", 0))
+            return data
+        
+        # Fallback: pumpportal.fun API (alternative source)
+        fallback_url = f"https://pumpportal.fun/api/data/{address}"
+        logger.info("pump.fun GET (fallback): %s", fallback_url)
+        data = await self._get(fallback_url)
+        if data and isinstance(data, dict) and (data.get("mint") or data.get("symbol")):
+            logger.info("pumpportal OK: %s | mcap=$%.0f", address[:8], data.get("market_cap_usd", 0))
+            # Normalize field names to match pump.fun format
+            normalized = {
+                "mint": data.get("mint", address),
+                "name": data.get("name", "Unknown"),
+                "symbol": data.get("symbol", "???"),
+                "usd_market_cap": _safe_float(data.get("market_cap_usd", 0)),
+                "total_supply": _safe_float(data.get("supply", 1_000_000_000)),
+                "real_sol_reserves": _safe_float(data.get("sol_reserve", 0)) * 1e9,  # convert SOL to lamports
+                "created_timestamp": data.get("created"),
+                "complete": data.get("is_graduated", False),
+                "reply_count": _safe_int(data.get("transactions_1h", 0)),
+            }
+            return normalized
+        
+        logger.warning("pump.fun: no data from any endpoint for %s", address[:8])
+        return None
 
     def _pumpfun_to_snapshot(self, data: dict, address: str) -> Dict[str, Any]:
         """
@@ -261,22 +284,41 @@ class TokenAnalyzer:
         """
         Fetch best trading pair from DexScreener.
         Only works for tokens that have graduated / been listed on a DEX.
+        
+        Tries multiple endpoints:
+        1. /tokens/v1/solana/{address} - new API v1
+        2. /latest/dex/search?{query}=q - search fallback
         """
+        # Try primary endpoint (API v1)
         url = f"{DEXSCREENER_BASE}/tokens/v1/solana/{address}"
+        logger.info("DexScreener GET (v1): %s", url[:80])
         data = await self._get(url)
-        if not data:
-            return None
-
-        pairs = data if isinstance(data, list) else data.get("pairs", [])
-        if not pairs:
-            return None
-
-        # Pick pair with highest liquidity
-        pairs.sort(
-            key=lambda x: _safe_float((x.get("liquidity") or {}).get("usd"), 0),
-            reverse=True,
-        )
-        return pairs[0]
+        if data:
+            pairs = data if isinstance(data, list) else data.get("pairs", [])
+            if pairs:
+                pairs.sort(
+                    key=lambda x: _safe_float((x.get("liquidity") or {}).get("usd"), 0),
+                    reverse=True,
+                )
+                logger.info("DexScreener OK (v1): %s | liquidity=$%.0f", address[:8], _safe_float(pairs[0].get("liquidity", {}).get("usd"), 0))
+                return pairs[0]
+        
+        # Fallback: search endpoint
+        search_url = f"{DEXSCREENER_BASE}/latest/dex/search?q={address}"
+        logger.info("DexScreener GET (search): %s", search_url[:80])
+        data = await self._get(search_url)
+        if data and isinstance(data, dict):
+            pairs = data.get("pairs", [])
+            if pairs:
+                pairs.sort(
+                    key=lambda x: _safe_float((x.get("liquidity") or {}).get("usd"), 0),
+                    reverse=True,
+                )
+                logger.info("DexScreener OK (search): %s | liquidity=$%.0f", address[:8], _safe_float(pairs[0].get("liquidity", {}).get("usd"), 0))
+                return pairs[0]
+        
+        logger.warning("DexScreener: no data for %s", address[:8])
+        return None
 
     async def fetch_dexscreener_price_at_time(
         self, pair_address: str, target_time: datetime
@@ -346,18 +388,36 @@ class TokenAnalyzer:
         Get current price from Jupiter Price API.
         Works for any SPL token with active trading.
         Free, no auth needed.
+        
+        Tries multiple endpoints:
+        1. /v6/price - latest API
+        2. /v4/price - fallback for older tokens
         """
+        # Try v6 API first
         url = f"{JUPITER_PRICE}?ids={address}"
+        logger.info("Jupiter GET (v6): %s", url[:80])
         data = await self._get(url)
-        if not data or not isinstance(data, dict):
-            return None
-        token_data = (data.get("data") or {}).get(address)
-        if not token_data:
-            return None
-        price = _safe_float(token_data.get("price"))
-        if price > 0:
-            logger.debug("Jupiter price OK: %s = $%.12f", address[:8], price)
-            return price
+        if data and isinstance(data, dict):
+            token_data = (data.get("data") or {}).get(address)
+            if token_data:
+                price = _safe_float(token_data.get("price"))
+                if price and price > 0:
+                    logger.info("Jupiter OK (v6): %s = $%.12f", address[:8], price)
+                    return price
+        
+        # Fallback to v4 API
+        fallback_url = f"https://price.jup.ag/v4/price?ids={address}"
+        logger.info("Jupiter GET (v4): %s", fallback_url[:80])
+        data = await self._get(fallback_url)
+        if data and isinstance(data, dict):
+            token_data = (data.get("data") or {}).get(address)
+            if token_data:
+                price = _safe_float(token_data.get("price"))
+                if price and price > 0:
+                    logger.info("Jupiter OK (v4): %s = $%.12f", address[:8], price)
+                    return price
+        
+        logger.warning("Jupiter: no price for %s", address[:8])
         return None
 
     # ── 4. Helius Enrichment ──────────────────────────────────────────────────
@@ -468,12 +528,19 @@ class TokenAnalyzer:
         Fetch token snapshot at call time.
 
         Strategy:
-          1. pump.fun API  → covers ~95% of pump.fun channel calls
-          2. DexScreener   → graduated tokens / non-pump.fun DEX tokens
-          3. Enrich both with Helius holder data (if key available)
-          4. Validate: skip if price=0 AND mcap=0
+          1. pump.fun API (with pumpportal fallback) → covers ~95% of pump.fun channel calls
+          2. DexScreener (v1 + search fallback) → graduated tokens / non-pump.fun DEX tokens
+          3. Jupiter Price (v6 + v4 fallback) → price confirmation
+          4. Enrich with Helius holder data (if key available)
+          5. Validate: skip if price=0 AND mcap=0
+        
+        IMPORTANT: This function ALWAYS tries to fetch fresh data from APIs.
+        It does NOT check the database first - every token call gets a fresh snapshot
+        so the bot can learn from real-time patterns.
         """
         snapshot: Optional[Dict[str, Any]] = None
+        
+        logger.info("=== FETCHING SNAPSHOT for %s at %s ===", address[:8], call_time.strftime("%Y-%m-%d %H:%M"))
 
         # ── Try pump.fun first ─────────────────────────────────────────────────
         pumpfun_data = await self.fetch_pumpfun(address)
@@ -548,6 +615,10 @@ class TokenAnalyzer:
             bc = _safe_int(snapshot.get("buy_count_1h", 0))
             sc = _safe_int(snapshot.get("sell_count_1h", 0))
             snapshot["buy_sell_ratio"] = round(bc / max(sc, 1), 3)
+        
+        logger.info("=== SNAPSHOT COMPLETE for %s | source=%s | price=$%.8f | mcap=$%.0f ===", 
+                   address[:8], snapshot.get("data_source", "?"), 
+                   snapshot.get("price_usd", 0), snapshot.get("market_cap", 0))
 
         return snapshot
 
