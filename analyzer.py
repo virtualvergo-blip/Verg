@@ -1,95 +1,115 @@
-import os
+"""
+analyzer.py — Token Analyzer dengan multi-source data fetching.
+
+Priority chain:
+  1. pump.fun API  → untuk token pre-graduation (MAYORITAS kasus)
+  2. DexScreener   → untuk token yang sudah graduate ke Raydium/Orca
+  3. Jupiter Price → konfirmasi harga real-time
+  4. Helius RPC    → holder count & token age (enrichment)
+"""
+
+from __future__ import annotations
+
 import asyncio
-import logging
-import aiohttp
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
-from groq import AsyncGroq
 import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+from groq import AsyncGroq
 
 logger = logging.getLogger(__name__)
 
-# ─── ENV ─────────────────────────────────────────────
-HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '').strip()
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '').strip()
-PUMP_THRESHOLD = float(os.environ.get('PUMP_THRESHOLD', '30'))
+# ─── ENV ──────────────────────────────────────────────────────────────────────
+HELIUS_API_KEY  = os.environ.get("HELIUS_API_KEY", "").strip()
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "").strip()
+PUMP_THRESHOLD  = float(os.environ.get("PUMP_THRESHOLD", "30"))
 
-GMGN_API_KEY = os.environ.get('GMGN_API_KEY', '').strip()
-GMGN_PROXY_URL = os.environ.get('GMGN_PROXY_URL', '').strip()
-
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 DEXSCREENER_BASE = "https://api.dexscreener.com"
-HELIUS_BASE = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+PUMPFUN_API      = "https://frontend-api.pump.fun"
+JUPITER_PRICE    = "https://price.jup.ag/v6/price"
 
-# GMGN: aktif kalau ada proxy URL
-_USE_GMGN = bool(GMGN_PROXY_URL)
-if _USE_GMGN:
-    try:
-        from gmgn_client import GMGNClient
-        _HAS_GMGN = True
-    except ImportError:
-        _HAS_GMGN = False
-        _USE_GMGN = False
-else:
-    _HAS_GMGN = False
-
-logger.info(f"Helius API: {'SET' if HELIUS_API_KEY else 'MISSING'}")
-logger.info(f"GMGN Proxy: {'ENABLED' if _USE_GMGN else 'DISABLED'}")
+logger.info("=== TokenAnalyzer INIT ===")
+logger.info("HELIUS_API_KEY set: %s", bool(HELIUS_API_KEY))
+logger.info("GROQ_API_KEY set  : %s", bool(GROQ_API_KEY))
 
 
-def _safe_float(val, default=0.0):
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def _safe_float(val, default: float = 0.0) -> float:
     if val is None:
         return default
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
         try:
-            return float(val.replace(',', '').replace('$', '').replace('K', '000').replace('M', '000000'))
+            v = val.replace(",", "").replace("$", "").strip()
+            if not v or v.lower() in ("none", "null", "nan", ""):
+                return default
+            if v.upper().endswith("K"):
+                return float(v[:-1]) * 1_000
+            if v.upper().endswith("M"):
+                return float(v[:-1]) * 1_000_000
+            if v.upper().endswith("B"):
+                return float(v[:-1]) * 1_000_000_000
+            return float(v)
         except (ValueError, AttributeError):
             return default
     if isinstance(val, dict):
-        for key in ('usd', 'value', 'amount', 'price', 'current', 'native'):
+        for key in ("usd", "value", "amount", "price", "current", "native"):
             if key in val and val[key] is not None:
                 return _safe_float(val[key], default)
         return default
     return default
 
 
-def _safe_int(val, default=0):
-    if val is None:
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(_safe_float(val, default))
+    except Exception:
         return default
-    if isinstance(val, (int, float)):
-        return int(val)
-    if isinstance(val, str):
-        try:
-            return int(float(val.replace(',', '').replace('K', '000')))
-        except (ValueError, AttributeError):
-            return default
-    if isinstance(val, dict):
-        for key in ('count', 'value', 'total', 'amount', 'holders'):
-            if key in val and val[key] is not None:
-                return _safe_int(val[key], default)
-        return default
-    return default
 
+
+def _age_hours(created_ts: Optional[int]) -> Optional[float]:
+    """Convert unix timestamp to age in hours."""
+    if not created_ts:
+        return None
+    try:
+        created = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+        return round((datetime.now(timezone.utc) - created).total_seconds() / 3600, 2)
+    except Exception:
+        return None
+
+
+# ─── ANALYZER ─────────────────────────────────────────────────────────────────
 
 class TokenAnalyzer:
     def __init__(self, db):
         self.db = db
-        self.groq = None
-        self.session = None
-        self.semaphore = asyncio.Semaphore(2)  # Lebih conservative
+        self.groq: Optional[AsyncGroq] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.semaphore = asyncio.Semaphore(3)
 
-        self.gmgn = None
-        if _USE_GMGN and _HAS_GMGN:
-            self.gmgn = GMGNClient(api_key=GMGN_API_KEY, proxy_url=GMGN_PROXY_URL)
-            logger.info(f"GMGN proxy: {GMGN_PROXY_URL[:50]}...")
+        if GROQ_API_KEY:
+            try:
+                import httpx
+                self.groq = AsyncGroq(
+                    api_key=GROQ_API_KEY,
+                    http_client=httpx.AsyncClient(timeout=30)
+                )
+                logger.info("Groq client initialized")
+            except Exception as e:
+                logger.warning("Groq init failed: %s", e)
 
-    # ─── SESSION ──────────────────────────────────────
+    # ── Session management ─────────────────────────────────────────────────────
 
-    async def get_session(self) -> aiohttp.ClientSession:
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=20),
+    async def _session_get(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -97,462 +117,552 @@ class TokenAnalyzer:
                         "Chrome/124.0.0.0 Safari/537.36"
                     ),
                     "Accept": "application/json",
-                }
+                },
             )
-        return self.session
+        return self._session
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-    # ─── RETRY ────────────────────────────────────────
+    # ── Generic HTTP with retry ────────────────────────────────────────────────
 
-    async def _fetch_with_retry(self, method: str, url: str, **kwargs) -> Optional[Dict]:
-        session = await self.get_session()
+    async def _get(self, url: str, **kwargs) -> Optional[Any]:
+        """GET request with retry on 429/5xx."""
+        session = await self._session_get()
         for attempt in range(1, 4):
             try:
                 async with self.semaphore:
-                    async with session.request(method, url, **kwargs) as resp:
+                    async with session.get(url, **kwargs) as resp:
                         if resp.status == 200:
-                            return await resp.json()
-                        elif resp.status == 429:
+                            return await resp.json(content_type=None)
+                        if resp.status == 429:
                             wait = 3 ** attempt
-                            logger.warning(f"429, retry in {wait}s")
+                            logger.warning("429 rate-limit, sleeping %ss | %s", wait, url[:60])
                             await asyncio.sleep(wait)
                         elif 500 <= resp.status < 600:
-                            wait = 2 ** attempt
-                            await asyncio.sleep(wait)
+                            await asyncio.sleep(2 ** attempt)
                         else:
-                            logger.warning(f"HTTP {resp.status} | {url[:70]}")
+                            logger.warning("HTTP %s | %s", resp.status, url[:80])
                             return None
             except asyncio.TimeoutError:
+                logger.warning("Timeout attempt %s | %s", attempt, url[:60])
                 await asyncio.sleep(2 ** attempt)
             except Exception as e:
-                logger.debug(f"Req error: {e}")
+                logger.debug("GET error attempt %s: %s | %s", attempt, e, url[:60])
                 await asyncio.sleep(2 ** attempt)
         return None
 
-    # ─── GMGN VIA PROXY ───────────────────────────────
-
-    async def fetch_gmgn_proxy(self, path: str, payload: Optional[Dict] = None) -> Optional[Dict]:
-        """Fetch via GMGN proxy worker."""
-        if not GMGN_PROXY_URL:
-            return None
-        
-        url = f"{GMGN_PROXY_URL}?path={path}"
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
-                if payload:
-                    async with s.post(url, json=payload) as r:
-                        text = await r.text()
-                        if r.status == 200:
-                            return json.loads(text)
-                        logger.warning(f"GMGN proxy POST {r.status}: {text[:100]}")
-                else:
-                    async with s.get(url) as r:
-                        text = await r.text()
-                        if r.status == 200:
-                            return json.loads(text)
-                        logger.warning(f"GMGN proxy GET {r.status}: {text[:100]}")
-        except Exception as e:
-            logger.warning(f"GMGN proxy error: {e}")
+    async def _post(self, url: str, payload: dict, **kwargs) -> Optional[Any]:
+        """POST request with retry on 429/5xx."""
+        session = await self._session_get()
+        for attempt in range(1, 4):
+            try:
+                async with self.semaphore:
+                    async with session.post(url, json=payload, **kwargs) as resp:
+                        if resp.status == 200:
+                            return await resp.json(content_type=None)
+                        if resp.status == 429:
+                            wait = 3 ** attempt
+                            logger.warning("429 rate-limit POST, sleeping %ss | %s", wait, url[:60])
+                            await asyncio.sleep(wait)
+                        elif 500 <= resp.status < 600:
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            logger.warning("HTTP %s POST | %s", resp.status, url[:80])
+                            return None
+            except asyncio.TimeoutError:
+                logger.warning("Timeout POST attempt %s | %s", attempt, url[:60])
+                await asyncio.sleep(2 ** attempt)
+            except Exception as e:
+                logger.debug("POST error attempt %s: %s | %s", attempt, e, url[:60])
+                await asyncio.sleep(2 ** attempt)
         return None
 
-    async def fetch_gmgn_token(self, address: str) -> Optional[Dict]:
-        """Get token data from GMGN via proxy."""
-        # Try multi-window endpoint
-        data = await self.fetch_gmgn_proxy(
-            "/api/v1/mutil_window_token_info",
-            {"chain": "sol", "addresses": [address]}
-        )
-        if data:
-            return self._extract_gmgn_token(data, address)
-        
-        # Fallback: single token endpoint
-        for ep in ["/defi/quotation/v1/tokens/sol/", "/defi/quotation/v1/token/sol/"]:
-            data = await self.fetch_gmgn_proxy(ep + address)
-            if data:
-                extracted = self._extract_gmgn_token(data, address)
-                if extracted:
-                    return extracted
-        return None
+    # ── 1. pump.fun API ────────────────────────────────────────────────────────
 
-    def _extract_gmgn_token(self, raw: Dict, address: str) -> Optional[Dict]:
-        """Extract token object dari berbagai format GMGN response."""
-        if not isinstance(raw, dict):
+    async def fetch_pumpfun(self, address: str) -> Optional[Dict]:
+        """
+        Fetch token data from pump.fun frontend API.
+        Works for ALL pump.fun tokens — both pre-graduation and graduated.
+        Returns raw pump.fun coin data or None.
+        """
+        url = f"{PUMPFUN_API}/coins/{address}"
+        logger.debug("pump.fun GET: %s", url)
+        data = await self._get(url)
+        if not data or not isinstance(data, dict):
             return None
-        
-        # Format 1: {code: 0, data: {tokens: [{...}]}}
-        if raw.get('code') == 0:
-            data = raw.get('data', {})
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-            if isinstance(data, dict):
-                tokens = data.get('tokens', [])
-                if tokens:
-                    return tokens[0]
-                # Cek kalau data langsung token
-                if 'address' in data or 'price' in data:
-                    return data
+        # Validate: must have mint + name/symbol
+        if not data.get("mint") and not data.get("name"):
+            logger.debug("pump.fun: invalid response for %s", address[:8])
             return None
-        
-        # Format 2: Direct token object
-        if 'address' in raw and ('price' in raw or 'market_cap' in raw):
-            return raw
-        
-        # Format 3: {token: {...}}
-        if 'token' in raw and isinstance(raw['token'], dict):
-            return raw['token']
-            
-        return None
+        logger.info("pump.fun OK: %s | mcap=$%.0f", address[:8], data.get("usd_market_cap", 0))
+        return data
 
-    async def fetch_gmgn_security(self, address: str) -> Optional[Dict]:
-        """Get security data from GMGN."""
-        data = await self.fetch_gmgn_proxy(f"/api/v1/token_security/sol/{address}")
-        if not data:
-            return None
-        
-        if isinstance(data, dict):
-            if data.get('code') == 0 and data.get('data'):
-                return data['data']
-            # Direct security object
-            if 'is_honeypot' in data or 'mintAuthority' in data:
-                return data
-        return None
+    def _pumpfun_to_snapshot(self, data: dict, address: str) -> Dict[str, Any]:
+        """
+        Convert pump.fun API response to unified snapshot format.
+        pump.fun doesn't provide volume/buy-sell directly, so those fields
+        will be None. Price is calculated from bonding curve reserves.
+        """
+        mint = data.get("mint", address)
+        name   = data.get("name", "Unknown")
+        symbol = data.get("symbol", "???")
 
-    # ─── DEXSCREENER ──────────────────────────────────
+        # Market cap in USD
+        usd_mcap = _safe_float(data.get("usd_market_cap"))
+
+        # Price: pump.fun gives usd_market_cap / total_supply
+        total_supply = _safe_float(data.get("total_supply", 1_000_000_000))
+        price_usd    = (usd_mcap / total_supply) if (usd_mcap and total_supply) else 0.0
+
+        # Liquidity: approximate from real_sol_reserves
+        # real_sol_reserves is in lamports (1 SOL = 1e9 lamports)
+        sol_reserves = _safe_float(data.get("real_sol_reserves", 0)) / 1e9
+        # Use a rough SOL price estimate from market cap context
+        # We'll enrich this later if needed; for now 0 is fine
+        liq_usd = 0.0
+
+        # Token age
+        created_ts = data.get("created_timestamp")
+        age_hours  = _age_hours(created_ts)
+
+        # Graduation status
+        graduated = bool(data.get("complete", False))
+
+        return {
+            "price_usd":          price_usd,
+            "market_cap":         usd_mcap,
+            "liquidity_usd":      liq_usd,
+            "volume_1h":          None,
+            "volume_6h":          None,
+            "volume_24h":         None,
+            "price_change_1h":    None,
+            "price_change_6h":    None,
+            "price_change_24h":   None,
+            "holder_count":       None,   # enriched by Helius
+            "top10_holder_pct":   None,   # enriched by Helius
+            "token_age_hours":    age_hours,
+            "buy_count_1h":       _safe_int(data.get("reply_count", 0)),  # rough proxy
+            "sell_count_1h":      0,
+            "buy_sell_ratio":     0.0,
+            "tx_count_24h":       None,
+            "dex_name":           "raydium" if graduated else "pumpfun_bonding_curve",
+            "symbol":             symbol,
+            "name":               name,
+            "graduated":          graduated,
+            "data_source":        "pumpfun",
+            "raw_json":           json.dumps(data)[:2000],
+        }
+
+    # ── 2. DexScreener ────────────────────────────────────────────────────────
 
     async def fetch_dexscreener(self, address: str) -> Optional[Dict]:
+        """
+        Fetch best trading pair from DexScreener.
+        Only works for tokens that have graduated / been listed on a DEX.
+        """
         url = f"{DEXSCREENER_BASE}/tokens/v1/solana/{address}"
-        data = await self._fetch_with_retry("GET", url)
+        data = await self._get(url)
         if not data:
             return None
-        
-        pairs = data if isinstance(data, list) else data.get('pairs', [])
+
+        pairs = data if isinstance(data, list) else data.get("pairs", [])
         if not pairs:
             return None
-        
+
+        # Pick pair with highest liquidity
         pairs.sort(
-            key=lambda x: _safe_float((x.get('liquidity') or {}).get('usd'), 0),
-            reverse=True
+            key=lambda x: _safe_float((x.get("liquidity") or {}).get("usd"), 0),
+            reverse=True,
         )
         return pairs[0]
 
     async def fetch_dexscreener_price_at_time(
         self, pair_address: str, target_time: datetime
     ) -> Optional[float]:
+        """Get historical price at a specific time via candles."""
         if not pair_address:
             return None
-        
         from_ts = int((target_time - timedelta(minutes=5)).timestamp())
-        to_ts = int((target_time + timedelta(minutes=5)).timestamp())
-        
+        to_ts   = int((target_time + timedelta(minutes=5)).timestamp())
         url = (
             f"{DEXSCREENER_BASE}/latest/dex/candles"
             f"/solana/{pair_address}?from={from_ts}&to={to_ts}&resolution=1"
         )
-        
-        data = await self._fetch_with_retry("GET", url)
+        data = await self._get(url)
         if not data or not isinstance(data, dict):
             return None
-        
-        candles = data.get('candles', [])
+        candles = data.get("candles", [])
         if not candles:
             return None
-        
         target_ts = target_time.timestamp()
-        closest = min(candles, key=lambda c: abs(c.get('t', 0) - target_ts))
-        return _safe_float(closest.get('c'))
+        closest   = min(candles, key=lambda c: abs(c.get("t", 0) - target_ts))
+        return _safe_float(closest.get("c")) or None
 
-    # ─── HELIUS ───────────────────────────────────────
+    def _dexscreener_to_snapshot(
+        self, pair: dict, address: str, price_at_call: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Convert DexScreener pair data to unified snapshot format."""
+        liquidity    = pair.get("liquidity", {}) or {}
+        volume       = pair.get("volume", {}) or {}
+        price_change = pair.get("priceChange", {}) or {}
+        txns         = pair.get("txns", {}) or {}
+        base         = pair.get("baseToken", {}) or {}
+
+        h1  = txns.get("h1",  {}) or {}
+        h24 = txns.get("h24", {}) or {}
+        buy_1h  = _safe_int(h1.get("buys",  0))
+        sell_1h = _safe_int(h1.get("sells", 0))
+
+        return {
+            "price_usd":         price_at_call or _safe_float(pair.get("priceUsd")),
+            "market_cap":        _safe_float(pair.get("marketCap")) or _safe_float(pair.get("fdv")),
+            "liquidity_usd":     _safe_float(liquidity.get("usd")),
+            "volume_1h":         _safe_float(volume.get("h1")),
+            "volume_6h":         _safe_float(volume.get("h6")),
+            "volume_24h":        _safe_float(volume.get("h24")),
+            "price_change_1h":   _safe_float(price_change.get("h1")),
+            "price_change_6h":   _safe_float(price_change.get("h6")),
+            "price_change_24h":  _safe_float(price_change.get("h24")),
+            "holder_count":      None,
+            "top10_holder_pct":  None,
+            "token_age_hours":   None,
+            "buy_count_1h":      buy_1h,
+            "sell_count_1h":     sell_1h,
+            "buy_sell_ratio":    round(buy_1h / max(sell_1h, 1), 3),
+            "tx_count_24h":      _safe_int(h24.get("buys", 0)) + _safe_int(h24.get("sells", 0)),
+            "dex_name":          pair.get("dexId", ""),
+            "symbol":            base.get("symbol", "???"),
+            "name":              base.get("name", "Unknown"),
+            "graduated":         True,
+            "data_source":       "dexscreener",
+        }
+
+    # ── 3. Jupiter Price ──────────────────────────────────────────────────────
+
+    async def fetch_jupiter_price(self, address: str) -> Optional[float]:
+        """
+        Get current price from Jupiter Price API.
+        Works for any SPL token with active trading.
+        Free, no auth needed.
+        """
+        url = f"{JUPITER_PRICE}?ids={address}"
+        data = await self._get(url)
+        if not data or not isinstance(data, dict):
+            return None
+        token_data = (data.get("data") or {}).get(address)
+        if not token_data:
+            return None
+        price = _safe_float(token_data.get("price"))
+        if price > 0:
+            logger.debug("Jupiter price OK: %s = $%.12f", address[:8], price)
+            return price
+        return None
+
+    # ── 4. Helius Enrichment ──────────────────────────────────────────────────
 
     async def fetch_helius_holders(self, address: str) -> Dict[str, Any]:
-        if not HELIUS_API_KEY:
-            return {'holder_count': None, 'top10_holder_pct': None}
-        
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "get-token-largest-accounts",
-            "method": "getTokenLargestAccounts",
-            "params": [address]
-        }
-        data = await self._fetch_with_retry("POST", HELIUS_BASE, json=payload)
-        if not data:
-            return {'holder_count': None, 'top10_holder_pct': None}
-        
-        try:
-            accounts = data.get('result', {}).get('value', [])
-            total_supply = sum(float(a.get('uiAmount', 0) or 0) for a in accounts)
-            top10 = accounts[:10]
-            top10_amount = sum(float(a.get('uiAmount', 0) or 0) for a in top10)
-            top10_pct = (top10_amount / total_supply * 100) if total_supply > 0 else 0
-            
-            return {
-                'holder_count': len(accounts),
-                'top10_holder_pct': round(top10_pct, 2)
-            }
-        except Exception as e:
-            logger.error(f"Helius holders: {e}")
-            return {'holder_count': None, 'top10_holder_pct': None}
+        """
+        Get holder count + top-10 concentration via Helius DAS API.
+        Uses getTokenAccounts (Helius custom) which returns result.total.
+        """
+        if not HELIUS_RPC:
+            return {"holder_count": None, "top10_holder_pct": None}
 
-    async def fetch_token_age(self, address: str) -> Optional[float]:
-        if not HELIUS_API_KEY:
-            return None
-        
+        # Step 1: Get total holder count (limit=1 is enough to get 'total')
         payload = {
             "jsonrpc": "2.0",
-            "id": "get-signatures",
-            "method": "getSignaturesForAddress",
-            "params": [address, {"limit": 1000, "commitment": "confirmed"}]
+            "id": "htk-count",
+            "method": "getTokenAccounts",
+            "params": {"page": 1, "limit": 1000, "mint": address},
         }
-        data = await self._fetch_with_retry("POST", HELIUS_BASE, json=payload)
+        data = await self._post(HELIUS_RPC, payload)
+        if not data:
+            return {"holder_count": None, "top10_holder_pct": None}
+
+        result = data.get("result", {})
+        if not result:
+            # Fallback: try standard getTokenLargestAccounts
+            return await self._helius_largest_accounts(address)
+
+        token_accounts = result.get("token_accounts", [])
+        total = result.get("total") or len(token_accounts)
+
+        # Step 2: Compute top-10 concentration from returned accounts
+        if token_accounts:
+            amounts = sorted(
+                [_safe_float(a.get("amount", 0)) for a in token_accounts],
+                reverse=True
+            )
+            total_amount = sum(amounts)
+            top10_amount = sum(amounts[:10])
+            top10_pct    = round(top10_amount / max(total_amount, 1) * 100, 2) if total_amount > 0 else None
+        else:
+            top10_pct = None
+
+        return {"holder_count": total, "top10_holder_pct": top10_pct}
+
+    async def _helius_largest_accounts(self, address: str) -> Dict[str, Any]:
+        """Fallback: use getTokenLargestAccounts to compute top-10 pct."""
+        if not HELIUS_RPC:
+            return {"holder_count": None, "top10_holder_pct": None}
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "gla",
+            "method": "getTokenLargestAccounts",
+            "params": [address],
+        }
+        data = await self._post(HELIUS_RPC, payload)
+        if not data:
+            return {"holder_count": None, "top10_holder_pct": None}
+        try:
+            accounts = data.get("result", {}).get("value", [])
+            if not accounts:
+                return {"holder_count": None, "top10_holder_pct": None}
+            amounts      = [_safe_float(a.get("uiAmount", 0)) for a in accounts]
+            total_amount = sum(amounts)
+            top10_amount = sum(amounts[:10])
+            top10_pct    = round(top10_amount / max(total_amount, 1) * 100, 2)
+            return {"holder_count": len(accounts), "top10_holder_pct": top10_pct}
+        except Exception as e:
+            logger.debug("Helius largest accounts error: %s", e)
+            return {"holder_count": None, "top10_holder_pct": None}
+
+    async def fetch_token_age_helius(self, address: str) -> Optional[float]:
+        """
+        Get token age in hours via Helius getSignaturesForAddress.
+        Finds the oldest signature = mint/creation transaction.
+        """
+        if not HELIUS_RPC:
+            return None
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "gsa",
+            "method": "getSignaturesForAddress",
+            "params": [address, {"limit": 1000, "commitment": "confirmed"}],
+        }
+        data = await self._post(HELIUS_RPC, payload)
         if not data:
             return None
-        
         try:
-            sigs = data.get('result', [])
+            sigs = data.get("result", [])
             if not sigs:
                 return None
-            oldest = sigs[-1]
-            block_time = oldest.get('blockTime')
+            oldest     = sigs[-1]
+            block_time = oldest.get("blockTime")
             if block_time:
-                created = datetime.fromtimestamp(block_time, tz=timezone.utc)
+                created   = datetime.fromtimestamp(block_time, tz=timezone.utc)
                 age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
                 return round(age_hours, 2)
         except Exception as e:
-            logger.error(f"Token age: {e}")
+            logger.debug("Token age error: %s", e)
         return None
 
-    # ─── MAIN SNAPSHOT ────────────────────────────────
+    # ── MAIN SNAPSHOT ─────────────────────────────────────────────────────────
 
-    async def fetch_snapshot(self, address: str, call_time: datetime) -> Optional[Dict[str, Any]]:
+    async def fetch_snapshot(
+        self, address: str, call_time: datetime
+    ) -> Optional[Dict[str, Any]]:
         """
-        Fetch snapshot AT CALL TIME.
-        Priority: GMGN (via proxy) → DexScreener + Helius
+        Fetch token snapshot at call time.
+
+        Strategy:
+          1. pump.fun API  → covers ~95% of pump.fun channel calls
+          2. DexScreener   → graduated tokens / non-pump.fun DEX tokens
+          3. Enrich both with Helius holder data (if key available)
+          4. Validate: skip if price=0 AND mcap=0
         """
-        snapshot = None
-        
-        # ── 1. GMGN via Proxy ──
-        if _USE_GMGN:
-            logger.info(f"GMGN proxy for {address[:8]}...")
-            gmgn_token = await self.fetch_gmgn_token(address)
-            if gmgn_token:
-                gmgn_security = await self.fetch_gmgn_security(address)
-                snapshot = self._gmgn_to_snapshot(gmgn_token, gmgn_security, address)
-                if snapshot:
-                    logger.info(f"✓ GMGN snapshot {address[:8]}")
-                    snapshot['data_source'] = 'gmgn'
-                    return snapshot
-            logger.info(f"✗ GMGN failed {address[:8]}, fallback...")
-        
-        # ── 2. DexScreener + Helius ──
-        pair, holders, age_hours = await asyncio.gather(
-            self.fetch_dexscreener(address),
-            self.fetch_helius_holders(address),
-            self.fetch_token_age(address),
-        )
-        
-        if not pair:
-            logger.warning(f"No DEX pair {address[:8]}")
+        snapshot: Optional[Dict[str, Any]] = None
+
+        # ── Try pump.fun first ─────────────────────────────────────────────────
+        pumpfun_data = await self.fetch_pumpfun(address)
+        if pumpfun_data:
+            snapshot = self._pumpfun_to_snapshot(pumpfun_data, address)
+
+            # If the token has graduated, also try to get richer DEX data
+            if snapshot.get("graduated"):
+                logger.info("%s graduated — enriching with DexScreener...", address[:8])
+                pair = await self.fetch_dexscreener(address)
+                if pair:
+                    pair_address  = pair.get("pairAddress", "")
+                    price_at_call = await self.fetch_dexscreener_price_at_time(pair_address, call_time)
+                    dex_snap      = self._dexscreener_to_snapshot(pair, address, price_at_call)
+                    # Merge: prefer DexScreener fields when available
+                    for field in ("volume_1h", "volume_6h", "volume_24h",
+                                  "price_change_1h", "price_change_6h", "price_change_24h",
+                                  "buy_count_1h", "sell_count_1h", "buy_sell_ratio",
+                                  "tx_count_24h", "dex_name", "liquidity_usd"):
+                        dex_val = dex_snap.get(field)
+                        if dex_val is not None and dex_val != 0:
+                            snapshot[field] = dex_val
+                    # Use DexScreener price if we have one (more accurate)
+                    if dex_snap.get("price_usd") and dex_snap["price_usd"] > 0:
+                        snapshot["price_usd"]  = dex_snap["price_usd"]
+                        snapshot["market_cap"] = dex_snap["market_cap"] or snapshot["market_cap"]
+                    snapshot["data_source"] = "pumpfun+dexscreener"
+
+        # ── Fallback to pure DexScreener ───────────────────────────────────────
+        if not snapshot:
+            logger.info("%s not on pump.fun, trying DexScreener...", address[:8])
+            pair = await self.fetch_dexscreener(address)
+            if pair:
+                pair_address  = pair.get("pairAddress", "")
+                price_at_call = await self.fetch_dexscreener_price_at_time(pair_address, call_time)
+                snapshot      = self._dexscreener_to_snapshot(pair, address, price_at_call)
+
+        if not snapshot:
+            logger.warning("No data source found for %s", address[:8])
             return None
-        
-        pair_address = pair.get('pairAddress', '')
-        price_at_call = await self.fetch_dexscreener_price_at_time(pair_address, call_time)
-        
-        liquidity = pair.get('liquidity', {}) or {}
-        volume = pair.get('volume', {}) or {}
-        price_change = pair.get('priceChange', {}) or {}
-        txns = pair.get('txns', {}) or {}
-        
-        buy_1h = (txns.get('h1') or {}).get('buys', 0) or 0
-        sell_1h = (txns.get('h1') or {}).get('sells', 0) or 0
-        bs_ratio = round(buy_1h / max(sell_1h, 1), 3)
-        
-        snapshot = {
-            'price_usd': price_at_call or _safe_float(pair.get('priceUsd')),
-            'market_cap': _safe_float(pair.get('marketCap')) or _safe_float(pair.get('fdv')),
-            'liquidity_usd': _safe_float(liquidity.get('usd')),
-            'volume_1h': _safe_float(volume.get('h1')),
-            'volume_6h': _safe_float(volume.get('h6')),
-            'volume_24h': _safe_float(volume.get('h24')),
-            'price_change_1h': _safe_float(price_change.get('h1')),
-            'price_change_6h': _safe_float(price_change.get('h6')),
-            'price_change_24h': _safe_float(price_change.get('h24')),
-            'holder_count': holders.get('holder_count'),
-            'top10_holder_pct': holders.get('top10_holder_pct'),
-            'token_age_hours': age_hours,
-            'buy_count_1h': buy_1h,
-            'sell_count_1h': sell_1h,
-            'buy_sell_ratio': bs_ratio,
-            'tx_count_24h': (
-                ((txns.get('h24') or {}).get('buys', 0) or 0) +
-                ((txns.get('h24') or {}).get('sells', 0) or 0)
-            ),
-            'dex_name': pair.get('dexId', ''),
-            'symbol': pair.get('baseToken', {}).get('symbol', '???'),
-            'name': pair.get('baseToken', {}).get('name', 'Unknown'),
-            'data_source': 'dexscreener',
-        }
-        
+
+        # ── Enrich with Jupiter price if price still 0 ────────────────────────
+        if not snapshot.get("price_usd") or snapshot["price_usd"] == 0:
+            jupiter_price = await self.fetch_jupiter_price(address)
+            if jupiter_price:
+                snapshot["price_usd"] = jupiter_price
+                # Estimate mcap if we don't have it
+                if not snapshot.get("market_cap"):
+                    snapshot["market_cap"] = jupiter_price * 1_000_000_000  # assume 1B supply
+
+        # ── Enrich with Helius holder data ────────────────────────────────────
+        if HELIUS_RPC and snapshot.get("holder_count") is None:
+            holders = await self.fetch_helius_holders(address)
+            snapshot.update({
+                "holder_count":     holders.get("holder_count"),
+                "top10_holder_pct": holders.get("top10_holder_pct"),
+            })
+
+        # ── Enrich token age if missing ────────────────────────────────────────
+        if snapshot.get("token_age_hours") is None and HELIUS_RPC:
+            snapshot["token_age_hours"] = await self.fetch_token_age_helius(address)
+
+        # ── Final validation ───────────────────────────────────────────────────
+        price = snapshot.get("price_usd", 0) or 0
+        mcap  = snapshot.get("market_cap", 0) or 0
+        if price == 0 and mcap == 0:
+            logger.warning("Zero price+mcap for %s, discarding snapshot", address[:8])
+            return None
+
+        # Build buy_sell_ratio if not set
+        if not snapshot.get("buy_sell_ratio"):
+            bc = _safe_int(snapshot.get("buy_count_1h", 0))
+            sc = _safe_int(snapshot.get("sell_count_1h", 0))
+            snapshot["buy_sell_ratio"] = round(bc / max(sc, 1), 3)
+
         return snapshot
 
-    def _gmgn_to_snapshot(
-        self, token: Dict, security: Optional[Dict], address: str
-    ) -> Optional[Dict[str, Any]]:
-        """Convert GMGN token data to snapshot format."""
-        try:
-            price = _safe_float(token.get('price'))
-            mcap = _safe_float(token.get('market_cap')) or _safe_float(token.get('fdv'))
-            liq = _safe_float(token.get('liquidity'))
-            
-            if price == 0 and mcap == 0:
-                return None
-            
-            # Volume bisa nested
-            vol_1h = _safe_float(token.get('volume_1h', token.get('volume1h')))
-            vol_6h = _safe_float(token.get('volume_6h', token.get('volume6h')))
-            vol_24h = _safe_float(token.get('volume_24h', token.get('volume24h')))
-            
-            # Kalau volume dict, coba ekstrak
-            if isinstance(token.get('volume'), dict):
-                v = token['volume']
-                vol_1h = vol_1h or _safe_float(v.get('1h'))
-                vol_6h = vol_6h or _safe_float(v.get('6h'))
-                vol_24h = vol_24h or _safe_float(v.get('24h'))
-            
-            snapshot = {
-                'price_usd': price,
-                'market_cap': mcap,
-                'liquidity_usd': liq,
-                'volume_1h': vol_1h,
-                'volume_6h': vol_6h,
-                'volume_24h': vol_24h,
-                'price_change_1h': _safe_float(token.get('price_change_1h', token.get('priceChange1h'))),
-                'price_change_6h': _safe_float(token.get('price_change_6h', token.get('priceChange6h'))),
-                'price_change_24h': _safe_float(token.get('price_change_24h', token.get('priceChange24h'))),
-                'holder_count': _safe_int(token.get('holder_count', token.get('holders'))) or None,
-                'top10_holder_pct': _safe_float(token.get('top10_holder_pct', token.get('top10Percentage'))) or None,
-                'token_age_hours': None,
-                'buy_count_1h': _safe_int(token.get('buy_1h', token.get('buy1h'))),
-                'sell_count_1h': _safe_int(token.get('sell_1h', token.get('sell1h'))),
-                'buy_sell_ratio': 0,
-                'tx_count_24h': _safe_int(token.get('tx_count_24h', token.get('tx24h'))),
-                'dex_name': token.get('dex', '') or token.get('platform', ''),
-                'symbol': token.get('symbol', '???') or '???',
-                'name': token.get('name', 'Unknown') or 'Unknown',
-                'security': security or {},
-            }
-            return snapshot
-            
-        except Exception as e:
-            logger.error(f"GMGN conversion: {e}")
-            return None
+    # ── CURRENT PRICE ─────────────────────────────────────────────────────────
 
     async def fetch_current_price(self, address: str) -> Optional[float]:
-        """Current price for labeling."""
-        # Try GMGN first
-        if _USE_GMGN:
-            try:
-                gmgn = await self.fetch_gmgn_token(address)
-                if gmgn:
-                    price = gmgn.get('price') or gmgn.get('last_price')
-                    if price:
-                        return _safe_float(price)
-            except Exception as e:
-                logger.debug(f"GMGN price error: {e}")
-        
-        # Fallback DexScreener
+        """
+        Get current price for labeling (PUMP / DUMP).
+        Tries Jupiter → pump.fun → DexScreener in order.
+        """
+        # 1. Jupiter (fast, reliable for traded tokens)
+        price = await self.fetch_jupiter_price(address)
+        if price and price > 0:
+            return price
+
+        # 2. pump.fun (for bonding curve tokens)
+        pf = await self.fetch_pumpfun(address)
+        if pf:
+            total_supply = _safe_float(pf.get("total_supply", 1_000_000_000))
+            usd_mcap     = _safe_float(pf.get("usd_market_cap", 0))
+            if usd_mcap and total_supply:
+                return usd_mcap / total_supply
+
+        # 3. DexScreener
         pair = await self.fetch_dexscreener(address)
         if pair:
-            return _safe_float(pair.get('priceUsd'))
+            return _safe_float(pair.get("priceUsd")) or None
+
         return None
 
-    # ─── AI ───────────────────────────────────────────
+    # ── AI ANALYSIS ───────────────────────────────────────────────────────────
 
     def build_feature_summary(self, snapshot: Dict) -> str:
-        age = snapshot.get('token_age_hours')
+        age    = snapshot.get("token_age_hours")
         age_str = f"{age:.1f}h" if age is not None else "unknown"
-        
-        top10 = snapshot.get('top10_holder_pct')
+
+        top10    = snapshot.get("top10_holder_pct")
         top10_str = f"{top10:.1f}%" if top10 is not None else "unknown"
-        
-        security = snapshot.get('security', {})
-        sec_lines = ""
-        if security:
-            flags = []
-            if security.get('is_honeypot'):
-                flags.append("🚨 HONEYPOT")
-            if security.get('mintAuthority'):
-                flags.append("MintAuth")
-            if security.get('freezeAuthority'):
-                flags.append("FreezeAuth")
-            if flags:
-                sec_lines = "\nSECURITY: " + " | ".join(flags)
-        
+
+        source = snapshot.get("data_source", "unknown")
+        graduated = "YES" if snapshot.get("graduated") else "NO (bonding curve)"
+
+        vol1h  = snapshot.get("volume_1h")
+        vol24h = snapshot.get("volume_24h")
+        vol1h_str  = f"${vol1h:,.0f}"  if vol1h  is not None else "N/A"
+        vol24h_str = f"${vol24h:,.0f}" if vol24h is not None else "N/A"
+
+        holders = snapshot.get("holder_count")
+        holder_str = str(holders) if holders is not None else "unknown"
+
         return (
             f"Token: {snapshot.get('name', '?')} ({snapshot.get('symbol', '?')})\n"
+            f"- Data Source:       {source.upper()}\n"
+            f"- Graduated DEX:     {graduated}\n"
             f"- Market Cap:        ${snapshot.get('market_cap', 0):,.0f}\n"
             f"- Liquidity:         ${snapshot.get('liquidity_usd', 0):,.0f}\n"
             f"- Token Age:         {age_str}\n"
-            f"- Volume 1h:         ${snapshot.get('volume_1h', 0):,.0f}\n"
-            f"- Volume 24h:        ${snapshot.get('volume_24h', 0):,.0f}\n"
-            f"- Price Change 1h:   {snapshot.get('price_change_1h', 0):+.1f}%\n"
-            f"- Price Change 24h:  {snapshot.get('price_change_24h', 0):+.1f}%\n"
-            f"- Buy/Sell Ratio 1h: {snapshot.get('buy_sell_ratio', 0):.2f}\n"
-            f"- Buys 1h:           {snapshot.get('buy_count_1h', 0)} "
-            f"| Sells 1h: {snapshot.get('sell_count_1h', 0)}\n"
-            f"- Holders:           {snapshot.get('holder_count', '?')}\n"
+            f"- Volume 1h:         {vol1h_str}\n"
+            f"- Volume 24h:        {vol24h_str}\n"
+            f"- Price Change 1h:   {snapshot.get('price_change_1h') or 'N/A'}\n"
+            f"- Price Change 24h:  {snapshot.get('price_change_24h') or 'N/A'}\n"
+            f"- Buy/Sell Ratio:    {snapshot.get('buy_sell_ratio', 0):.2f}\n"
+            f"- Buys 1h:           {snapshot.get('buy_count_1h', 0)}"
+            f" | Sells 1h: {snapshot.get('sell_count_1h', 0)}\n"
+            f"- Holders:           {holder_str}\n"
             f"- Top 10 Holders:    {top10_str}\n"
             f"- DEX:               {snapshot.get('dex_name', '?')}"
-            f"{sec_lines}"
         )
 
     def build_historical_context(self) -> str:
-        winners = self.db.get_labeled_tokens('PUMP', limit=30)
-        losers = self.db.get_labeled_tokens('DUMP', limit=30)
+        winners = self.db.get_labeled_tokens("PUMP", limit=50)
+        losers  = self.db.get_labeled_tokens("DUMP",  limit=50)
 
-        def summarize_group(tokens: List[Dict], label: str) -> str:
+        def summarize(tokens: List[Dict], label: str) -> str:
             if not tokens:
                 return f"No {label} data yet."
+            n = len(tokens)
 
-            avg_mcap = sum(t.get('market_cap', 0) or 0 for t in tokens) / len(tokens)
-            avg_liq = sum(t.get('liquidity_usd', 0) or 0 for t in tokens) / len(tokens)
-            avg_age = sum(t.get('token_age_hours', 0) or 0 for t in tokens) / len(tokens)
-            avg_bs = sum(t.get('buy_sell_ratio', 0) or 0 for t in tokens) / len(tokens)
-            top10_vals = [t.get('top10_holder_pct', 0) or 0 for t in tokens if t.get('top10_holder_pct')]
-            avg_top10 = sum(top10_vals) / len(top10_vals) if top10_vals else 0
+            def avg(key):
+                vals = [t.get(key) or 0 for t in tokens if t.get(key) is not None]
+                return sum(vals) / len(vals) if vals else 0
 
             return (
-                f"{label} tokens ({len(tokens)} samples):\n"
-                f"  Avg Market Cap:        ${avg_mcap:,.0f}\n"
-                f"  Avg Liquidity:         ${avg_liq:,.0f}\n"
-                f"  Avg Token Age:         {avg_age:.1f}h\n"
-                f"  Avg Buy/Sell Ratio:    {avg_bs:.2f}\n"
-                f"  Avg Top10 Holder %:    {avg_top10:.1f}%"
+                f"{label} tokens ({n} samples):\n"
+                f"  Avg Market Cap:     ${avg('market_cap'):,.0f}\n"
+                f"  Avg Liquidity:      ${avg('liquidity_usd'):,.0f}\n"
+                f"  Avg Token Age:      {avg('token_age_hours'):.1f}h\n"
+                f"  Avg Buy/Sell Ratio: {avg('buy_sell_ratio'):.2f}\n"
+                f"  Avg Top10 Hold %:   {avg('top10_holder_pct'):.1f}%\n"
+                f"  Avg Holders:        {avg('holder_count'):.0f}"
             )
 
         return (
             "HISTORICAL PATTERN SUMMARY:\n"
-            f"{summarize_group(winners, 'PUMP')}\n\n"
-            f"{summarize_group(losers, 'DUMP')}"
+            f"{summarize(winners, 'PUMP')}\n\n"
+            f"{summarize(losers, 'DUMP')}"
         )
 
     async def predict(self, address: str, snapshot: Dict) -> Dict[str, Any]:
+        _default = {
+            "score": 50, "verdict": "CAUTION",
+            "reasoning": "AI not configured",
+            "red_flags": [], "green_flags": [],
+            "similar_winners": 0, "similar_losers": 0,
+        }
+
         if not self.groq:
-            logger.warning("Groq not configured")
-            return {
-                'score': 50, 'verdict': 'CAUTION',
-                'reasoning': 'AI not configured',
-                'red_flags': [], 'green_flags': [],
-                'similar_winners': 0, 'similar_losers': 0,
-            }
+            logger.warning("Groq not configured, returning default prediction")
+            return _default
 
-        stats = self.db.get_stats()
+        stats          = self.db.get_stats()
         historical_ctx = self.build_historical_context()
-        token_summary = self.build_feature_summary(snapshot)
+        token_summary  = self.build_feature_summary(snapshot)
 
-        prompt = f"""You are an expert Solana memecoin on-chain analyst...
+        prompt = f"""You are an expert Solana memecoin on-chain analyst specializing in pump.fun tokens.
 
 {historical_ctx}
 
@@ -562,49 +672,36 @@ Now analyze this NEW token:
 {token_summary}
 
 Based on historical patterns, assess if this token is likely to PUMP (>{PUMP_THRESHOLD:.0f}% gain within 24h) or DUMP.
+Key signals: low market cap + high buy/sell ratio + recent token + healthy holder distribution = potential PUMP.
+Honeypot signals: very old age, zero volume, no holders data, only on bonding curve with no activity.
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON (no markdown, no extra text):
 {{
-  "score": <0-100>,
+  "score": <0-100, where 100 = very likely PUMP>,
   "verdict": "<GO|CAUTION|SKIP>",
-  "reasoning": "<2-3 sentences>",
-  "red_flags": ["<flag1>"],
-  "green_flags": ["<flag1>"],
-  "similar_winners": <int>,
-  "similar_losers": <int>
+  "reasoning": "<2-3 sentence analysis>",
+  "red_flags": ["<flag1>", "<flag2>"],
+  "green_flags": ["<flag1>", "<flag2>"],
+  "similar_winners": <int: how many historical PUMPs have similar profile>,
+  "similar_losers": <int: how many historical DUMPs have similar profile>
 }}"""
 
         try:
-            if not self.groq:
-                import httpx
-                from groq import AsyncGroq
-                self.groq = AsyncGroq(api_key=GROQ_API_KEY, http_client=httpx.AsyncClient())
-
-            response = await self.groq.chat.completions.create(
+            resp = await self.groq.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=500
+                max_tokens=500,
             )
-            
-            raw = response.choices[0].message.content.strip()
-            raw = raw.replace('```json', '').replace('```', '').strip()
+            raw = resp.choices[0].message.content.strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
             result = json.loads(raw)
-
             self.db.save_prediction(address, result)
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parse: {e}")
-            return {
-                'score': 50, 'verdict': 'CAUTION',
-                'reasoning': 'Parse error', 'red_flags': [], 'green_flags': [],
-                'similar_winners': 0, 'similar_losers': 0,
-            }
+            logger.error("Groq JSON parse error: %s", e)
+            return _default
         except Exception as e:
-            logger.error(f"Groq: {e}")
-            return {
-                'score': 50, 'verdict': 'CAUTION',
-                'reasoning': f'Error: {str(e)}', 'red_flags': [], 'green_flags': [],
-                'similar_winners': 0, 'similar_losers': 0,
-            }
+            logger.error("Groq API error: %s", e)
+            return {**_default, "reasoning": f"AI error: {str(e)[:80]}"}
