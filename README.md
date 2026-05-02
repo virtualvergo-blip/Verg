@@ -1,4 +1,4 @@
- 🤖 Solana Signal Filter Bot
+🤖 Solana Signal Filter Bot
 
 Bot yang mempelajari pattern token dari signal channel Telegram, membandingkan on-chain data, dan memprediksi apakah token baru akan PUMP atau DUMP.
 
@@ -9,8 +9,11 @@ Channel signal kirim token address
         ↓
 Bot capture + catat timestamp
         ↓
-Fetch data on-chain (Helius + DexScreener)
-  - Snapshot SAAT token di-call (bukan sekarang)
+Fetch CURRENT on-chain data (PARALLEL):
+  - pump.fun API → pre-graduation tokens
+  - DexScreener → graduated/Raydium tokens  
+  - Birdeye → broader DEX coverage
+  - Jupiter Price → price confirmation
         ↓
 Groq AI analisa vs historical patterns
         ↓
@@ -22,6 +25,8 @@ Auto-label: PUMP atau DUMP
         ↓
 Bot makin pintar seiring waktu 🧠
 ```
+
+**PENTING:** Crypto APIs tidak menyediakan snapshot historis pada waktu arbitrer. Bot mengambil data **CURRENT** setiap kali token di-call dan menggunakannya sebagai sample pembelajaran. Labeling (PUMP/DUMP) dilakukan dengan membandingkan entry price vs current price setelah 24 jam.
 
 -----
 
@@ -84,7 +89,7 @@ TELEGRAM_SESSION_STRING = dari generate_session.py
 SOURCE_CHANNEL          = @nama_channel atau -1001234567890
 TELEGRAM_BOT_TOKEN      = dari BotFather
 NOTIFY_CHAT_ID          = chat id kamu
-HELIUS_API_KEY          = dari helius.dev
+HELIUS_API_KEY          = dari helius.dev (optional)
 GROQ_API_KEY            = dari console.groq.com
 PUMP_THRESHOLD          = 30
 DB_PATH                 = /data/signals.db
@@ -106,7 +111,7 @@ Railway akan otomatis deploy dan menjalankan `python main.py`
 
 ## Backfill Data Historis
 
-Sebelum bot live, jalankan backfill untuk melatih bot dengan data April lalu:
+Sebelum bot live, jalankan backfill untuk mengumpulkan data pembelajaran:
 
 ```bash
 # Install dependencies lokal
@@ -120,10 +125,15 @@ cp .env.example .env
 python backfill.py --limit 2000 --days 90
 ```
 
-Proses ini bisa makan waktu 30-60 menit tergantung jumlah token. Hasilnya:
+**Proses backfill sekarang menggunakan PARALLEL FETCHING** yang 3x lebih cepat dari sequential requests. Setiap token akan diambil datanya dari multiple sources secara bersamaan:
+- pump.fun API
+- DexScreener
+- Birdeye
+- Jupiter Price
 
+Hasilnya:
 - Database terisi dengan ratusan token berlabel PUMP/DUMP
-- Bot langsung punya “sense” dari hari pertama live
+- Bot langsung punya "sense" dari hari pertama live
 
 -----
 
@@ -132,10 +142,10 @@ Proses ini bisa makan waktu 30-60 menit tergantung jumlah token. Hasilnya:
 ```
 solana-signal-bot/
 ├── main.py              # Entry point, monitor channel
-├── analyzer.py          # Fetch on-chain data + Groq AI analysis
+├── analyzer.py          # Fetch on-chain data (parallel) + Groq AI analysis
 ├── database.py          # SQLite database handler
 ├── notifier.py          # Telegram notification formatter
-├── backfill.py          # Historical data scraper
+├── backfill.py          # Historical data scraper with parallel fetching
 ├── generate_session.py  # Session string generator (jalankan lokal)
 ├── requirements.txt
 ├── Procfile             # Railway process definition
@@ -152,7 +162,7 @@ solana-signal-bot/
 🎯 AI Score: 78/100
 ████████░░
 
-📊 Snapshot at Call Time
+📊 Current Snapshot
 ├ Market Cap: $2.4M
 ├ Liquidity:  $380K
 ├ Vol 1h:     $125K
@@ -190,3 +200,6 @@ A: Ya — modifikasi `SOURCE_CHANNEL` di `main.py` menjadi list, dan update even
 
 **Q: Bagaimana cara reset label manual?**
 A: Buka SQLite (`signals.db`) dan update kolom `label` di tabel `token_calls`.
+
+**Q: Kenapa backfill gagal fetch data token?**
+A: Beberapa token mungkin sudah tidak aktif/rugged. Bot sekarang menggunakan parallel fetching dari 4 sumber berbeda (pump.fun, DexScreener, Birdeye, Jupiter) untuk memaksimalkan kemungkinan mendapatkan data. Jika semua source gagal, token akan di-skip.

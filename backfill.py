@@ -133,7 +133,10 @@ async def backfill(limit: int, days: int, skip_recent_hours: float = 0) -> None:
             db.save_call(addr, call_time, raw_msg)
 
             try:
-                # ── Fetch snapshot at call time ─────────────────────────────
+                # ── Fetch snapshot (current data, not historical) ─────────────
+                # NOTE: Crypto APIs don't provide historical snapshots at arbitrary times.
+                # We fetch CURRENT data and use it as the learning sample.
+                # Labeling (PUMP/DUMP) is done by comparing entry price vs current price later.
                 snapshot = await analyzer.fetch_snapshot(addr, call_time)
                 if not snapshot:
                     logger.warning("  ✗ No snapshot data — skipping %s", addr[:8])
@@ -152,6 +155,7 @@ async def backfill(limit: int, days: int, skip_recent_hours: float = 0) -> None:
                 )
 
                 # ── Label: PUMP or DUMP ────────────────────────────────────
+                # For tokens called >24h ago, we can label them based on current performance
                 if hours_ago >= 24:
                     current_price = await analyzer.fetch_current_price(addr)
                     entry_price   = snapshot.get("price_usd", 0) or 0
