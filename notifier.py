@@ -16,10 +16,6 @@ class Notifier:
         self.bot_token = BOT_TOKEN
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
 
-    # ─────────────────────────────────────────────
-    # FORMATTING HELPERS
-    # ─────────────────────────────────────────────
-
     def verdict_emoji(self, verdict: str) -> str:
         return {'GO': '🟢', 'CAUTION': '🟡', 'SKIP': '🔴'}.get(verdict, '⚪')
 
@@ -36,10 +32,6 @@ class Notifier:
         if n >= 1_000:
             return f"${n / 1_000:.1f}K"
         return f"${n:.2f}"
-
-    # ─────────────────────────────────────────────
-    # MESSAGE SENDERS
-    # ─────────────────────────────────────────────
 
     async def send_prediction(
         self,
@@ -66,6 +58,10 @@ class Notifier:
 
         bs = snapshot.get('buy_sell_ratio', 0)
 
+        # Data source indicator
+        source = snapshot.get('data_source', 'unknown')
+        source_emoji = {'gmgn': '📡', 'dexscreener': '📊'}.get(source, '❓')
+
         green_lines = '\n'.join(f"  ✅ {f}" for f in green_flags) if green_flags else "  —"
         red_lines   = '\n'.join(f"  ❌ {f}" for f in red_flags)   if red_flags   else "  —"
 
@@ -75,6 +71,7 @@ class Notifier:
             f"🎯 <b>AI Score: {score}/100</b>\n"
             f"<code>{self.score_bar(score)}</code>\n"
             f"\n"
+            f"{source_emoji} <b>Source: {source.upper()}</b>\n"
             f"📊 <b>Snapshot at Call Time</b>\n"
             f"├ Market Cap: <b>{self.format_number(snapshot.get('market_cap', 0))}</b>\n"
             f"├ Liquidity:  <b>{self.format_number(snapshot.get('liquidity_usd', 0))}</b>\n"
@@ -109,7 +106,6 @@ class Notifier:
         pct_change: float,
         label: str,
     ):
-        """Send update when token gets auto-labeled"""
         emoji = '🚀' if label == 'PUMP' else '📉'
         msg = (
             f"{emoji} <b>Result Update — {symbol}</b>\n"
@@ -135,10 +131,6 @@ class Notifier:
             f"Avg Pump:    <b>+{stats['avg_pump_pct']}%</b>"
         )
         await self._send(chat_id, msg)
-
-    # ─────────────────────────────────────────────
-    # INTERNAL
-    # ─────────────────────────────────────────────
 
     async def _send(self, chat_id: str, text: str):
         if not self.bot_token:
