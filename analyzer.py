@@ -20,8 +20,7 @@ HELIUS_BASE = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 class TokenAnalyzer:
     def __init__(self, db):
         self.db = db
-        self.groq = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.groq = Npne # initialized lazily in preidct()
 
     # ─────────────────────────────────────────────
     # SESSION MANAGEMENT
@@ -348,13 +347,35 @@ Respond ONLY with valid JSON, no markdown, no explanation outside JSON:
 }}"""
 
         try:
+            if not self.groq:
+                import httpx
+                from groq import AsyncGroq
+                self.groq = AsyncGroq(
+                    api_key=GROQ_API_KEY,
+                    http_client=httpx.AsyncClient()
+                )
+
             response = await self.groq.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=500
             )
+            
+            raw = response.choices[0].message.content.strip()
+            raw = raw.replace('```json', '').replace('```', '').strip()
+            result = json.loads(raw)
 
+            self.db.save_prediction(address, result)
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error in prediction: {e}")
+            return {'score': 50, 'verdict': 'CAUTION', 'reasoning': 'Analysis parse error', 'similar_winners': 0, 'similar_losers': 0}
+        except Exception as e:
+            logger.error(f"groq prediction error: {e}")
+            return {'score': 50, 'verdict': 'CAUTION', 'reasoning': f'Analysis error: {str(e)}', 'similar_winners': 0, 'similar_losers': 0}
+   
             raw = response.choices[0].message.content.strip()
             # Strip potential markdown fences
             raw = raw.replace('```json', '').replace('```', '').strip()
