@@ -15,10 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Solana address regex (base58, 32-44 chars)
 SOLANA_ADDR_RE = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b')
 
-# Known non-token addresses to skip
 SKIP_ADDRESSES = {
     '11111111111111111111111111111111',
     'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
@@ -37,8 +35,8 @@ class SignalBot:
         self.api_id = int(os.environ['TELEGRAM_API_ID'])
         self.api_hash = os.environ['TELEGRAM_API_HASH']
         self.session_string = os.environ['TELEGRAM_SESSION_STRING']
-        self.source_channel = os.environ['SOURCE_CHANNEL']   # username or -100xxxxx id
-        self.notify_chat_id = os.environ['NOTIFY_CHAT_ID']   # your personal chat id
+        self.source_channel = os.environ['SOURCE_CHANNEL']
+        self.notify_chat_id = os.environ['NOTIFY_CHAT_ID']
 
         self.client = TelegramClient(
             StringSession(self.session_string),
@@ -50,7 +48,6 @@ class SignalBot:
         msg = event.message
         text = msg.text or ''
 
-        # Extract all Solana addresses from message
         addresses = SOLANA_ADDR_RE.findall(text)
         if not addresses:
             return
@@ -61,28 +58,25 @@ class SignalBot:
             if addr in SKIP_ADDRESSES:
                 continue
 
-            # Skip if already tracked
             if self.db.token_exists(addr):
                 logger.info(f"Token {addr[:8]}... already in DB, skipping")
                 continue
 
             logger.info(f"New token detected: {addr[:8]}... at {timestamp}")
 
-            # Save call to DB immediately
             self.db.save_call(addr, timestamp, text)
 
-            # Fetch snapshot data at call time
             snapshot = await self.analyzer.fetch_snapshot(addr, timestamp)
             if not snapshot:
                 logger.warning(f"Could not fetch snapshot for {addr[:8]}...")
                 continue
 
             self.db.save_snapshot(addr, snapshot)
+            source = snapshot.get('data_source', 'unknown')
+            logger.info(f"Snapshot from {source.upper()} for {addr[:8]}")
 
-            # Run AI analysis
             prediction = await self.analyzer.predict(addr, snapshot)
 
-            # Send notification
             await self.notifier.send_prediction(
                 self.notify_chat_id,
                 addr,
@@ -91,13 +85,11 @@ class SignalBot:
                 timestamp
             )
 
-            # Schedule label check (1h, 6h, 24h after call)
             asyncio.create_task(
                 self.schedule_label_check(addr, timestamp, snapshot)
             )
 
     async def schedule_label_check(self, addr: str, call_time: datetime, snapshot: dict):
-        """Check price at 1h, 6h, 24h after call and auto-label result"""
         windows = [
             (3_600,  '1h'),
             (21_600, '6h'),
@@ -117,7 +109,6 @@ class SignalBot:
                     self.db.save_price_check(addr, window_label, current, pct_change)
                     logger.info(f"{addr[:8]}... {window_label} result: {pct_change:+.1f}%")
 
-                    # Auto-label after 24h
                     if window_label == '24h':
                         outcome = 'PUMP' if pct_change >= PUMP_THRESHOLD else 'DUMP'
                         self.db.update_label(addr, outcome, pct_change)
@@ -131,7 +122,6 @@ class SignalBot:
         await self.client.start()
         logger.info("Telethon client started")
 
-        # Resolve source channel
         try:
             entity = await self.client.get_entity(self.source_channel)
             title = entity.title if hasattr(entity, 'title') else self.source_channel
