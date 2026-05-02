@@ -35,13 +35,16 @@ SKIP_ADDRESSES = {
     "11111111111111111111111111111111",
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
     "So11111111111111111111111111111111111111112",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
 }
 
 
 def required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
-        raise SystemExit(f"Missing required environment variable: {name}")
+        raise SystemExit(f"❌ Missing required environment variable: {name}")
     return value
 
 
@@ -51,35 +54,36 @@ def to_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-async def backfill(limit: int, days: int) -> None:
+async def backfill(limit: int, days: int, skip_recent_hours: float = 0) -> None:
     db = Database()
     db.init()
 
     analyzer = TokenAnalyzer(db)
     notifier = Notifier()
 
-    api_id = int(required_env("TELEGRAM_API_ID"))
-    api_hash = required_env("TELEGRAM_API_HASH")
+    api_id         = int(required_env("TELEGRAM_API_ID"))
+    api_hash       = required_env("TELEGRAM_API_HASH")
     session_string = required_env("TELEGRAM_SESSION_STRING")
     source_channel = required_env("SOURCE_CHANNEL")
     notify_chat_id = os.getenv("NOTIFY_CHAT_ID", "").strip()
 
     pump_threshold = float(os.getenv("PUMP_THRESHOLD", "30"))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff         = datetime.now(timezone.utc) - timedelta(days=days)
 
     client = TelegramClient(StringSession(session_string), api_id, api_hash)
 
     found_addresses: Dict[str, Tuple[datetime, str]] = {}
     msg_count = 0
-    success = 0
-    failed = 0
+    success   = 0
+    failed    = 0
+    skipped   = 0
 
     try:
         await client.start()
-        logger.info("Telethon client started for backfill")
+        logger.info("✓ Telethon client started for backfill")
 
         entity = await client.get_entity(source_channel)
-        logger.info("Scraping channel: %s", getattr(entity, "title", source_channel))
+        logger.info("📡 Scraping channel: %s", getattr(entity, "title", source_channel))
 
         async for msg in client.iter_messages(entity, limit=limit):
             if not msg.date:
@@ -96,6 +100,8 @@ async def backfill(limit: int, days: int) -> None:
             for addr in addresses:
                 if addr in SKIP_ADDRESSES:
                     continue
+                if len(addr) < 32 or len(addr) > 44:
+                    continue
                 if db.token_exists(addr):
                     continue
                 if addr not in found_addresses:
@@ -109,81 +115,94 @@ async def backfill(limit: int, days: int) -> None:
                     len(found_addresses),
                 )
 
-        logger.info("Scrape complete. Found %s unique new token addresses", len(found_addresses))
+        logger.info("✓ Scrape complete. Found %s unique new token addresses", len(found_addresses))
 
         now = datetime.now(timezone.utc)
 
         for i, (addr, (call_time, raw_msg)) in enumerate(found_addresses.items(), 1):
+            hours_ago = (now - call_time).total_seconds() / 3600
             logger.info(
-                "[%s/%s] Processing %s... called at %s",
+                "[%s/%s] Processing %s... | called %s (%.1fh ago)",
                 i,
                 len(found_addresses),
                 addr[:8],
                 call_time.strftime("%Y-%m-%d %H:%M"),
+                hours_ago,
             )
 
             db.save_call(addr, call_time, raw_msg)
 
             try:
-                # Fetch snapshot AT CALL TIME (historical)
+                # ── Fetch snapshot at call time ─────────────────────────────
                 snapshot = await analyzer.fetch_snapshot(addr, call_time)
                 if not snapshot:
-                    logger.warning("  No snapshot data, skipping")
+                    logger.warning("  ✗ No snapshot data — skipping %s", addr[:8])
                     failed += 1
                     await asyncio.sleep(1)
                     continue
 
                 db.save_snapshot(addr, snapshot)
-                source = snapshot.get('data_source', 'unknown')
-                price = snapshot.get('price_usd', 0)
-                logger.info(f"  ✓ Snapshot from {source.upper()} | price=${price:.10f}")
+                source = snapshot.get("data_source", "unknown")
+                price  = snapshot.get("price_usd", 0) or 0
+                mcap   = snapshot.get("market_cap", 0) or 0
 
-                hours_since_call = (now - call_time).total_seconds() / 3600
+                logger.info(
+                    "  ✓ Snapshot from %s | price=$%.12f | mcap=$%.0f",
+                    source.upper(), price, mcap,
+                )
 
-                if hours_since_call >= 24:
-                    # Check current price to label PUMP/DUMP
+                # ── Label: PUMP or DUMP ────────────────────────────────────
+                if hours_ago >= 24:
                     current_price = await analyzer.fetch_current_price(addr)
-                    entry_price = snapshot.get("price_usd", 0)
+                    entry_price   = snapshot.get("price_usd", 0) or 0
 
                     if current_price and entry_price and entry_price > 0:
-                        pct = ((current_price - entry_price) / entry_price) * 100
+                        pct   = ((current_price - entry_price) / entry_price) * 100
                         label = "PUMP" if pct >= pump_threshold else "DUMP"
                         db.update_label(addr, label, pct)
                         logger.info("  → Labeled %s (%+.1f%%)", label, pct)
-                    else:
+                    elif not entry_price or entry_price == 0:
+                        # No entry price means token was already dead/rugged
                         db.update_label(addr, "DUMP", -100.0)
-                        logger.info("  → No current price, labeled DUMP")
+                        logger.info("  → No entry price — labeled DUMP")
+                    else:
+                        # Has entry price but can't get current price = dead token
+                        db.update_label(addr, "DUMP", -100.0)
+                        logger.info("  → No current price (likely dead) — labeled DUMP")
                 else:
                     logger.info(
-                        "  → Recent call (%.1fh ago), pending label",
-                        hours_since_call,
+                        "  → Recent call (%.1fh ago) — pending label", hours_ago
                     )
 
                 success += 1
-                await asyncio.sleep(1)  # Rate limit safety
 
             except Exception as exc:
                 logger.exception("  Error processing %s: %s", addr[:8], exc)
                 failed += 1
                 await asyncio.sleep(2)
+                continue
 
+            # Rate limit: be nice to APIs
+            await asyncio.sleep(0.8)
+
+        # ── Summary ────────────────────────────────────────────────────────
         stats = db.get_stats()
         logger.info(
             "\n"
             "═══════════════════════════════════\n"
-            "BACKFILL COMPLETE\n"
+            "         BACKFILL COMPLETE\n"
             "═══════════════════════════════════\n"
             "Messages scanned:       %s\n"
             "Tokens found:           %s\n"
-            "Successfully processed: %s\n"
-            "Failed:                 %s\n"
+            "  ✓ Processed:          %s\n"
+            "  ✗ Failed:             %s\n"
             "\n"
-            "Database now has:\n"
+            "Database totals:\n"
             "  Total calls:  %s\n"
-            "  Pumps:        %s\n"
-            "  Dumps:        %s\n"
-            "  Pending:      %s\n"
-            "  Winrate:      %s%%\n"
+            "  Pumps:        %s 🟢\n"
+            "  Dumps:        %s 🔴\n"
+            "  Pending:      %s ⏳\n"
+            "  Win rate:     %s%%\n"
             "═══════════════════════════════════",
             msg_count,
             len(found_addresses),
@@ -196,8 +215,11 @@ async def backfill(limit: int, days: int) -> None:
             stats.get("winrate"),
         )
 
-        if notify_chat_id:
-            await notifier.send_stats(notify_chat_id, stats)
+        if notify_chat_id and notifier:
+            try:
+                await notifier.send_stats(notify_chat_id, stats)
+            except Exception as e:
+                logger.warning("Could not send stats notification: %s", e)
 
     finally:
         await analyzer.close()
@@ -207,7 +229,7 @@ async def backfill(limit: int, days: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill historical channel calls")
     parser.add_argument("--limit", type=int, default=2000, help="Max messages to scan")
-    parser.add_argument("--days", type=int, default=90, help="How many days back to scan")
+    parser.add_argument("--days",  type=int, default=90,   help="How many days back to scan")
     args = parser.parse_args()
 
     try:
