@@ -1,0 +1,4 @@
+telethon==1.36.0
+aiohttp==3.10.10
+groq==0.11.0
+python-dotenv==1.0.1
