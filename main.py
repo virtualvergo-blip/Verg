@@ -1,167 +1,181 @@
+import os
+import sys
 import asyncio
 import logging
 import re
-import os
+from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from datetime import datetime, timezone
-from database import Database
-from analyzer import TokenAnalyzer
-from notifier import Notifier
+from telethon.sessions import StringSession as TelethonStringSession
+import aiohttp
 
+# Import modules lokal
+from analyzer import TokenAnalyzer
+from database import DatabaseManager
+
+# Setup Logging (Tanpa Emoji agar aman di Windows)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler('bot_live.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-SOLANA_ADDR_RE = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b')
+# --- Konfigurasi ---
+API_ID = os.getenv("TELEGRAM_API_ID")
+API_HASH = os.getenv("TELEGRAM_API_HASH")
+SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "https://t.me/pumpfunnevadie")
+NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID")
 
-SKIP_ADDRESSES = {
-    '11111111111111111111111111111111',
-    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-    'So11111111111111111111111111111111111111112',
-}
+if not API_ID or not API_HASH:
+    logger.error("ERROR: Missing TELEGRAM_API_ID or HASH in .env")
+    sys.exit(1)
 
-PUMP_THRESHOLD = float(os.environ.get('PUMP_THRESHOLD', '30'))
+# Inisialisasi
+db = DatabaseManager()
+db.init_db()
+analyzer = TokenAnalyzer()
+session_obj = TelethonStringSession(SESSION_STRING)
+client = TelegramClient(session_obj, int(API_ID), API_HASH)
 
-# Pattern untuk skip pesan update (bukan call baru)
-UPDATE_PATTERNS = [
-    re.compile(r'\d+\.\d+x', re.I),           # "2.7x", "3.6x"
-    re.compile(r'from\s+premium', re.I),        # "from PREMIUM"
-    re.compile(r'update:', re.I),              # "Update: Cancer Coin"
-    re.compile(r'🎉.*\$[A-Z]+', re.I),         # "🎉 $CANCER 2.7x"
-]
-
-
-class SignalBot:
-    def __init__(self):
-        self.db = Database()
-        self.analyzer = TokenAnalyzer(self.db)
-        self.notifier = Notifier()
-
-        self.api_id = int(os.environ['TELEGRAM_API_ID'])
-        self.api_hash = os.environ['TELEGRAM_API_HASH']
-        self.session_string = os.environ['TELEGRAM_SESSION_STRING']
-        self.source_channel = os.environ['SOURCE_CHANNEL']
-        self.notify_chat_id = os.environ['NOTIFY_CHAT_ID']
-
-        self.client = TelegramClient(
-            StringSession(self.session_string),
-            self.api_id,
-            self.api_hash
-        )
-
-    def is_update_message(self, text: str) -> bool:
-        """Check if message is an update (not a new call)."""
-        for pattern in UPDATE_PATTERNS:
-            if pattern.search(text):
-                return True
-        return False
-
-    async def handle_new_message(self, event):
-        msg = event.message
-        text = msg.text or ''
-
-        # Skip update messages (pump updates, not new calls)
-        if self.is_update_message(text):
-            logger.info("Skipping update message")
-            return
-
-        addresses = SOLANA_ADDR_RE.findall(text)
-        if not addresses:
-            return
-
-        timestamp = msg.date.replace(tzinfo=timezone.utc)
-
-        for addr in addresses:
-            if addr in SKIP_ADDRESSES:
-                continue
-
-            if self.db.token_exists(addr):
-                logger.info(f"Token {addr[:8]}... already in DB, skipping")
-                continue
-
-            logger.info(f"New token call: {addr[:8]}... at {timestamp}")
-
-            self.db.save_call(addr, timestamp, text)
-
-            snapshot = await self.analyzer.fetch_snapshot(addr, timestamp)
-            if not snapshot:
-                logger.warning(f"No snapshot for {addr[:8]}...")
-                continue
-
-            self.db.save_snapshot(addr, snapshot)
-            source = snapshot.get('data_source', 'unknown')
-            logger.info(f"Snapshot from {source.upper()} for {addr[:8]}")
-
-            prediction = await self.analyzer.predict(addr, snapshot)
-
-            await self.notifier.send_prediction(
-                self.notify_chat_id,
-                addr,
-                snapshot,
-                prediction,
-                timestamp
+async def process_new_signal(message):
+    """Fungsi utama saat ada sinyal baru masuk"""
+    text = message.message
+    if not text: return
+    
+    # Ekstrak CA (Contract Address)
+    cas = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', text)
+    
+    for ca in cas:
+        # Cek duplikasi
+        if db.get_token(ca):
+            logger.info(f"Token {ca[:8]} sudah diproses sebelumnya. Skip.")
+            continue
+            
+        call_time = message.date
+        logger.info(f"🚀 NEW SIGNAL DETECTED: {ca[:8]} at {call_time.strftime('%H:%M:%S')}")
+        
+        # 1. Fetch Data Real-Time (Harga masih hangat!)
+        logger.info(f"⏳ Fetching live data for {ca[:8]}...")
+        snapshot = await analyzer.fetch_snapshot(ca, call_time)
+        
+        if snapshot and snapshot.get('price'):
+            price = snapshot.get('price')
+            mcap = snapshot.get('mcap', 0)
+            liq = snapshot.get('liquidity', 0)
+            source = snapshot.get('source', 'unknown')
+            
+            logger.info(f"✅ Data Found: Price=${price} | MCAP=${mcap} | Source={source}")
+            
+            # 2. Simpan ke DB dengan status PENDING
+            db.save_token(
+                address=ca,
+                name=snapshot.get('name', 'Unknown'),
+                symbol=snapshot.get('symbol', 'Unknown'),
+                price_entry=price,
+                mcap_entry=mcap,
+                liquidity_entry=liq,
+                call_time=call_time,
+                source=source,
+                status='PENDING'
             )
+            
+            # 3. Analisis AI Langsung
+            prediction = await analyzer.analyze(snapshot)
+            logger.info(f"🤖 AI Prediction: {prediction}")
+            
+            # 4. Kirim Notifikasi ke User
+            if BOT_TOKEN and NOTIFY_CHAT_ID:
+                await send_notification(ca, snapshot, prediction)
+                
+            # 5. Jadwalkan pengecekan labeling (1h, 6h, 24h)
+            # Dalam implementasi sederhana, kita bisa buat task background atau cek saat bot nyala
+            asyncio.create_task(schedule_labeling(ca, call_time))
+            
+        else:
+            logger.warning(f"❌ Gagal mengambil data untuk {ca[:8]}. Mungkin token rugpull instan atau tidak terindeks.")
 
-            asyncio.create_task(
-                self.schedule_label_check(addr, timestamp, snapshot)
-            )
+async def schedule_labeling(ca, call_time):
+    """Task background untuk update status PUMP/DUMP"""
+    intervals = [
+        (1, "1H"),
+        (6, "6H"),
+        (24, "24H")
+    ]
+    
+    for hours, label_name in intervals:
+        wait_time = hours * 3600
+        logger.info(f"⏰ Menunggu {label_name} untuk {ca[:8]} ({hours} jam)...")
+        await asyncio.sleep(wait_time)
+        
+        # Cek harga sekarang
+        current_data = await analyzer.fetch_snapshot(ca, datetime.now(timezone.utc))
+        if current_data and current_data.get('price'):
+            entry_price = db.get_token(ca)['price_entry']
+            curr_price = current_data['price']
+            
+            change_pct = ((curr_price - entry_price) / entry_price) * 100
+            
+            status = "DUMP"
+            if change_pct > 0:
+                status = "PUMP"
+            elif change_pct < -50: # Toleransi sedikit
+                status = "DUMP"
+            else:
+                status = "DEAD/FLAT"
+                
+            db.update_status(ca, status, change_pct, label_name)
+            logger.info(f"🏷️ Label Updated {ca[:8]} [{label_name}]: {status} ({change_pct:.2f}%)")
 
-    async def schedule_label_check(self, addr: str, call_time: datetime, snapshot: dict):
-        windows = [
-            (3_600,  '1h'),
-            (21_600, '6h'),
-            (86_400, '24h'),
-        ]
-        entry_price = snapshot.get('price_usd', 0)
-        if not entry_price:
-            logger.warning(f"No entry price for {addr[:8]}...")
-            return
+async def send_notification(ca, data, prediction):
+    """Kirim pesan ke Telegram user"""
+    try:
+        from telethon.sync import TelegramClient as SyncClient
+        # Gunakan bot token untuk kirim pesan
+        async with SyncClient(BOT_TOKEN) as bot_client:
+            msg = f"""
+🚨 **NEW SIGNAL ANALYSIS** 🚨
 
-        for delay_sec, window_label in windows:
-            await asyncio.sleep(delay_sec)
-            try:
-                current = await self.analyzer.fetch_current_price(addr)
-                if current and entry_price:
-                    pct_change = ((current - entry_price) / entry_price) * 100
-                    self.db.save_price_check(addr, window_label, current, pct_change)
-                    logger.info(f"{addr[:8]}... {window_label}: {pct_change:+.1f}%")
+💎 **Token:** {data.get('name')} ({data.get('symbol')})
+📝 **CA:** `{ca}`
+💰 **Price:** ${data.get('price')}
+📊 **MCap:** ${data.get('mcap')}
+💧 **Liq:** ${data.get('liquidity')}
+📡 **Source:** {data.get('source')}
 
-                    if window_label == '24h':
-                        outcome = 'PUMP' if pct_change >= PUMP_THRESHOLD else 'DUMP'
-                        self.db.update_label(addr, outcome, pct_change)
-                        logger.info(f"Auto-labeled {addr[:8]}... as {outcome}")
-            except Exception as e:
-                logger.error(f"Label check error {addr[:8]}... {window_label}: {e}")
+🤖 **AI Prediction:**
+{prediction}
 
-    async def run(self):
-        await self.client.start()
-        logger.info("Telethon client started")
-
-        try:
-            entity = await self.client.get_entity(self.source_channel)
-            title = entity.title if hasattr(entity, 'title') else self.source_channel
-            logger.info(f"Monitoring channel: {title}")
-        except Exception as e:
-            logger.error(f"Could not resolve channel: {e}")
-            return
-
-        @self.client.on(events.NewMessage(chats=entity))
-        async def handler(event):
-            await self.handle_new_message(event)
-
-        logger.info("Bot is live. Listening for signals...")
-        await self.client.run_until_disconnected()
-
+⚠️ *DYOR. Not financial advice.*
+            """
+            await bot_client.send_message(int(NOTIFY_CHAT_ID), msg, parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"Gagal kirim notifikasi: {e}")
 
 async def main():
-    bot = SignalBot()
-    bot.db.init()
-    logger.info("Database initialized")
-    await bot.run()
+    logger.info("🚀 Starting LIVE SIGNAL MONITORING BOT...")
+    logger.info(f"Monitoring Channel: {SOURCE_CHANNEL}")
+    
+    await client.connect()
+    if not await client.is_user_authorized():
+        logger.error("Session tidak valid. Harap generate session string baru.")
+        return
 
+    @client.on(events.NewMessage(chats=[SOURCE_CHANNEL]))
+    async def handler(event):
+        await process_new_signal(event.message)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+    logger.info("✅ Bot is LIVE! Waiting for signals...")
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+    finally:
+        asyncio.run(analyzer.close_session())
